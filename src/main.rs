@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 use rayon::prelude::*;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// 出力ファイルパスにタイムスタンプ (YYYYMMDD_HHMMSS) を挿入する
 /// 例: "shift_path.txt" -> "shift_path_20260831_153000.txt"
@@ -305,24 +305,22 @@ impl State {
             }
 
             // 枝刈り
-            if count < self.limit.max(self.max_count) {
+            if count < self.limit {
                 self.key.pop();
                 continue;
             }
 
-            // 葉ノード処理
+            // 葉ノード処理（現在ノードの count == limit なら記録して探索全体を終了）
             if level + 1 >= depth {
-                if !(depth == self.max_depth && count > self.target) {
-                    if count > self.max_count {
-                        self.max_count = count;
-                        self.results = 1;
-                        self.shifts.clear();
-                        self.shifts.push(self.key.clone());
-                        info!("done key={:?} count={}", self.key, count);
-                    } else if count == self.max_count {
-                        self.results += 1;
-                        self.shifts.push(self.key.clone());
-                    }
+                if count > self.max_count {
+                    self.max_count = count;
+                }
+                if count == self.limit {
+                    self.results += 1;
+                    self.shifts.push(self.key.clone());
+                    info!("target level={} key={:?} count={}", level, self.key, count);
+                    self.key.pop();
+                    break;
                 }
                 self.key.pop();
                 continue;
@@ -347,13 +345,11 @@ impl State {
         let num_threads = rayon::current_num_threads();
         info!("並列探索スレッド数: {}", num_threads);
 
-        // 頻繁に参照・更新する値は Atomic に（ロックフリー）
         let max_count = Arc::new(AtomicUsize::new(0));
         let results = Arc::new(AtomicUsize::new(0));
-        // shifts (Vec<Vec<usize>>) は Atomic 化できないため Mutex で保護
-        // （新記録・タイ更新時のみアクセスするので競合は稀）
         let shifts = Arc::new(Mutex::new(Vec::<Vec<usize>>::new()));
         let node_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
 
         // 進捗バー（indicatif の ProgressBar は内部で共有状態を持つため
         // 複数スレッドから安全に更新できる）
@@ -367,12 +363,26 @@ impl State {
         let p0 = self.primes[0];
 
         (0..p0).into_par_iter().for_each(|i| {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+
             let mut key = vec![i];
             let row_complement = &self.shift_table[0][i];
             let base_mask = self.zero_mask.bitand(row_complement);
             let count = base_mask.count_ones();
 
             if count < self.limit {
+                return;
+            }
+
+            if depth == 1 {
+                max_count.fetch_max(count, Ordering::Relaxed);
+                if count == self.limit && !stop.swap(true, Ordering::Relaxed) {
+                    results.fetch_add(1, Ordering::Relaxed);
+                    shifts.lock().unwrap().push(key.clone());
+                    info!("target level=0 key={:?} count={}", key, count);
+                }
                 return;
             }
 
@@ -384,6 +394,10 @@ impl State {
             }];
 
             while let Some(frame) = stack.last_mut() {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+
                 if frame.next_idx >= frame.next_p {
                     stack.pop();
                     if stack.last().is_some() {
@@ -404,43 +418,30 @@ impl State {
                 let node_mask = current_base.bitand(complement);
                 let c_count = node_mask.count_ones();
 
-                // ★ ロックなしで読める（Atomic load）
-                let current_max = max_count.load(Ordering::Relaxed);
-
-                // 進捗表示（indicatif 側で描画頻度が間引かれるため、
-                // 複数スレッドから呼んでも描画コストは問題にならない）
                 if n % 10_000 == 0 {
                     pb.set_position(n);
                     pb.set_message(format!(
                         "best: {} | hits: {} | depth: {}",
-                        current_max,
+                        max_count.load(Ordering::Relaxed),
                         results.load(Ordering::Relaxed),
                         key.len()
                     ));
                 }
 
-                if c_count < self.limit.max(current_max) {
+                if c_count < self.limit {
                     key.pop();
                     continue;
                 }
 
                 if level + 1 >= depth {
-                    if !(depth == self.max_depth && c_count > self.target) {
-                        // ★ 更新が必要な「稀なケース」だけロックを取る
-                        if c_count >= max_count.load(Ordering::Relaxed) {
-                            let mut shifts_guard = shifts.lock().unwrap();
-                            // ロック内で再度比較（他スレッドが割り込んでいる可能性があるため）
-                            if c_count > max_count.load(Ordering::Relaxed) {
-                                max_count.store(c_count, Ordering::Relaxed);
-                                results.store(1, Ordering::Relaxed);
-                                shifts_guard.clear();
-                                shifts_guard.push(key.clone());
-                                info!("done key={:?} count={}", key, c_count);
-                            } else if c_count == max_count.load(Ordering::Relaxed) {
-                                results.fetch_add(1, Ordering::Relaxed);
-                                shifts_guard.push(key.clone());
-                            }
-                        }
+                    max_count.fetch_max(c_count, Ordering::Relaxed);
+                    if c_count == self.limit && !stop.swap(true, Ordering::Relaxed) {
+                        results.fetch_add(1, Ordering::Relaxed);
+                        shifts.lock().unwrap().push(key.clone());
+                        info!("target level={} key={:?} count={}", level, key, c_count);
+                    }
+                    if stop.load(Ordering::Relaxed) {
+                        break;
                     }
                     key.pop();
                     continue;

@@ -1,177 +1,19 @@
-use chrono::Local;
-use clap::{Parser, ValueEnum};
-use indicatif::{ProgressBar, ProgressStyle};
+mod bitmask;
+mod output;
+mod primes;
+mod search;
+
+use clap::Parser;
 use log::{info, LevelFilter};
+use output::with_timestamp;
+use primes::generate_primes;
+use search::{build_shift_table, SearchMode, State};
 use simple_logger::SimpleLogger;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::time::Instant;
-use rayon::prelude::*;
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-/// 出力ファイルパスにタイムスタンプ (YYYYMMDD_HHMMSS) を挿入する
-/// 例: "shift_path.txt" -> "shift_path_20260831_153000.txt"
-/// 拡張子が無い場合は末尾にそのまま付加する
-fn with_timestamp(path: &PathBuf) -> PathBuf {
-    let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
-
-    let parent = path.parent();
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("output");
-    let ext = path.extension().and_then(|s| s.to_str());
-
-    let new_name = match ext {
-        Some(ext) => format!("{}_{}.{}", stem, timestamp, ext),
-        None => format!("{}_{}", stem, timestamp),
-    };
-
-    match parent {
-        Some(p) if !p.as_os_str().is_empty() => p.join(new_name),
-        _ => PathBuf::from(new_name),
-    }
-}
-
-/// 素数生成（エラトステネスの篩）
-pub fn generate_primes(limit: usize) -> Vec<usize> {
-    if limit < 2 {
-        return Vec::new();
-    }
-    let mut is_prime = vec![true; limit + 1];
-    is_prime[0] = false;
-    is_prime[1] = false;
-
-    let sqrt_limit = (limit as f64).sqrt() as usize;
-    for p in 2..=sqrt_limit {
-        if is_prime[p] {
-            let mut step = p * p;
-            while step <= limit {
-                is_prime[step] = false;
-                step += p;
-            }
-        }
-    }
-
-    is_prime
-        .iter()
-        .enumerate()
-        .filter_map(|(n, &p)| if p { Some(n) } else { None })
-        .collect()
-}
-
-/// BitVec による高速なビットマスク操作構造体
-#[derive(Clone, Debug)]
-pub struct BitMask {
-    data: Vec<u64>,
-    size: usize,
-}
-
-impl BitMask {
-    pub fn new_ones(size: usize) -> Self {
-        let num_words = (size + 63) / 64;
-        let mut data = vec![u64::MAX; num_words];
-        // 不要な余りビットをクリア
-        if size % 64 != 0 {
-            let remainder = size % 64;
-            data[num_words - 1] = (1u64 << remainder) - 1;
-        }
-        BitMask { data, size }
-    }
-
-    pub fn new_zeros(size: usize) -> Self {
-        let num_words = (size + 63) / 64;
-        BitMask {
-            data: vec![0; num_words],
-            size,
-        }
-    }
-
-    /// bitwise AND
-    #[inline]
-    pub fn bitand(&self, rhs: &Self) -> Self {
-        let data = self
-            .data
-            .iter()
-            .zip(rhs.data.iter())
-            .map(|(&a, &b)| a & b)
-            .collect();
-        BitMask {
-            data,
-            size: self.size,
-        }
-    }
-
-    /// 1 (true) のビット数をカウント (popcount)
-    #[inline]
-    pub fn count_ones(&self) -> usize {
-        self.data.iter().map(|&w| w.count_ones() as usize).sum()
-    }
-
-    /// 指定したインデックスのビットをセット
-    #[inline]
-    pub fn set(&mut self, idx: usize, val: bool) {
-        if idx >= self.size {
-            return;
-        }
-        let word = idx / 64;
-        let bit = idx % 64;
-        if val {
-            self.data[word] |= 1u64 << bit;
-        } else {
-            self.data[word] &= !(1u64 << bit);
-        }
-    }
-}
-
-/// 基底行の生成と補集合シフトテーブルの作成
-pub fn build_shift_table(primes: &[usize], cols: usize) -> Vec<Vec<BitMask>> {
-    let mut shift_table = Vec::with_capacity(primes.len());
-
-    for &p in primes {
-        let mut complement_shifts = Vec::with_capacity(p);
-        for k in 0..p {
-            // ~shift_array(base_row, k) に相当するビットマスクを直接構築
-            let mut mask = BitMask::new_ones(cols);
-            for col in 0..cols {
-                let idx = col + 1; // 1-indexed (idx % p == 1)
-                if col >= k {
-                    let orig_idx = idx - k;
-                    if orig_idx % p == 1 {
-                        mask.set(col, false); // NOT演算
-                    }
-                }
-            }
-            complement_shifts.push(mask);
-        }
-        shift_table.push(complement_shifts);
-    }
-
-    shift_table
-}
-
-/// スタックフレーム構造体（非再帰 DFS 用）
-#[derive(Clone)]
-struct Frame {
-    level: usize,
-    base_mask: BitMask,
-    /// 未探索の次インデックス（降順）。`next_p` で初期化し、0 でその階層を終了する
-    next_idx: usize,
-    next_p: usize,
-}
-
-/// 探索モード（逐次 / 並列）
-#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
-pub enum SearchMode {
-    /// 単一スレッドの非再帰 DFS（進捗バー表示あり）
-    Sequential,
-    /// Rayon による並列 DFS（デフォルト）
-    Parallel,
-}
-
-/// CLI 引数定義 (clap)
 #[derive(Parser, Debug)]
 #[command(author, version, about = "HLSearch: 素数シフト探索プログラム (Rust版)", long_about = None)]
 pub struct Cli {
@@ -202,294 +44,69 @@ pub struct Cli {
     #[arg(long, help = "使用する素数の個数制限")]
     pub primes_count: Option<usize>,
 
-    #[arg(short, long, default_value = "shift_path.txt", help = "出力ファイルパス")]
+    #[arg(
+        short,
+        long,
+        default_value = "shift_path.txt",
+        help = "出力ファイルパス"
+    )]
     pub output: PathBuf,
 }
 
-/// スレッド間で共有する最良結果データ
-#[derive(Default)]
-pub struct SharedResults {
-    pub max_count: usize,
-    pub results: usize,
-    pub shifts: Vec<Vec<usize>>,
-}
-
-pub struct State {
-    pub primes: Vec<usize>,
-    pub depth: usize,
-    pub limit: usize,
-    pub max_depth: usize,
-    pub target: usize,
-    pub cols: usize,
-
-    pub key: Vec<usize>,
-    pub zero_mask: BitMask,
-    pub max_count: usize,
-    pub results: usize,
-    pub shifts: Vec<Vec<usize>>,
-    pub node_count: u64,
-    shift_table: Vec<Vec<BitMask>>,
-}
-
-impl State {
-    pub fn new(
-        primes: Vec<usize>,
-        depth: usize,
-        limit: usize,
-        max_depth: usize,
-        target: usize,
-        cols: usize,
-        shift_table: Vec<Vec<BitMask>>,
-    ) -> Self {
-        let zero_mask = BitMask::new_ones(cols);
-        State {
-            primes,
-            depth,
-            limit,
-            max_depth,
-            target,
-            cols,
-            key: Vec::new(),
-            zero_mask,
-            max_count: 0,
-            results: 0,
-            shifts: Vec::new(),
-            node_count: 0,
-            shift_table,
+impl Cli {
+    fn validate(&self, available_primes: usize) -> Result<(), String> {
+        if self.depth == 0 {
+            return Err("depth must be at least 1".to_string());
         }
-    }
-
-    /// スタックによる非再帰 DFS 探索実行
-    pub fn search(&mut self, depth: usize) {
-        let pb = ProgressBar::new_spinner();
-        pb.set_style(
-            ProgressStyle::default_spinner()
-                .template("{spinner:.green} [{elapsed_precise}] nodes: {human_pos} ({per_sec}) {msg}")
-                .unwrap(),
-        );
-
-        let mut stack = vec![Frame {
-            level: 0,
-            base_mask: self.zero_mask.clone(),
-            next_idx: self.primes[0],
-            next_p: self.primes[0],
-        }];
-
-        while let Some(frame) = stack.last_mut() {
-            if frame.next_idx == 0 {
-                stack.pop();
-                if let Some(parent) = stack.last() {
-                    self.key.pop();
-                    self.zero_mask = parent.base_mask.clone();
-                }
-                continue;
+        if self.cols == 0 {
+            return Err("cols must be at least 1".to_string());
+        }
+        if self.limit > self.cols {
+            return Err(format!(
+                "limit ({}) cannot exceed cols ({})",
+                self.limit, self.cols
+            ));
+        }
+        if let Some(primes_count) = self.primes_count {
+            if primes_count == 0 {
+                return Err("primes-count must be at least 1".to_string());
             }
-
-            frame.next_idx -= 1;
-            let i = frame.next_idx;
-            let level = frame.level;
-            let base_mask = frame.base_mask.clone();
-
-            self.key.push(i);
-            self.node_count += 1;
-
-            let row_complement = &self.shift_table[level][i];
-            let node_mask = base_mask.bitand(row_complement);
-            let count = node_mask.count_ones();
-
-            if self.node_count % 10_000 == 0 {
-                pb.set_position(self.node_count);
-                pb.set_message(format!(
-                    "best: {} | hits: {} | depth: {}",
-                    self.max_count, self.results, self.key.len()
+            if primes_count > available_primes {
+                return Err(format!(
+                    "primes-count ({}) cannot exceed available primes ({})",
+                    primes_count, available_primes
                 ));
             }
-
-            // 枝刈り
-            if count < self.limit {
-                self.key.pop();
-                continue;
+            if self.depth > primes_count {
+                return Err(format!(
+                    "depth ({}) cannot exceed primes-count ({})",
+                    self.depth, primes_count
+                ));
             }
-
-            // 葉ノード処理（現在ノードの count == limit なら記録して探索全体を終了）
-            if level + 1 >= depth {
-                if count > self.max_count {
-                    self.max_count = count;
-                }
-                if count == self.limit {
-                    self.results += 1;
-                    self.shifts.push(self.key.clone());
-                    info!("target level={} key={:?} count={}", level, self.key, count);
-                    self.key.pop();
-                    break;
-                }
-                self.key.pop();
-                continue;
-            }
-
-            // 子階層への展開
-            self.zero_mask = node_mask.clone();
-            let next_p_child = self.primes[level + 1];
-            stack.push(Frame {
-                level: level + 1,
-                base_mask: node_mask,
-                next_idx: next_p_child,
-                next_p: next_p_child,
-            });
+        } else if self.depth > available_primes {
+            return Err(format!(
+                "depth ({}) cannot exceed available primes ({})",
+                self.depth, available_primes
+            ));
         }
-
-        pb.finish_with_message("探索完了");
-    }
-
-    /// Rayon による並列 DFS 探索実行
-    pub fn search_parallel(&self, depth: usize) -> SharedResults {
-        let num_threads = rayon::current_num_threads();
-        info!("並列探索スレッド数: {}", num_threads);
-
-        let max_count = Arc::new(AtomicUsize::new(0));
-        let results = Arc::new(AtomicUsize::new(0));
-        let shifts = Arc::new(Mutex::new(Vec::<Vec<usize>>::new()));
-        let node_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let stop = Arc::new(AtomicBool::new(false));
-
-        // 進捗バー（indicatif の ProgressBar は内部で共有状態を持つため
-        // 複数スレッドから安全に更新できる）
-        let pb = ProgressBar::new_spinner();
-        pb.set_style(
-            ProgressStyle::default_spinner()
-                .template("{spinner:.green} [{elapsed_precise}] nodes: {human_pos} ({per_sec}) {msg}")
-                .unwrap(),
-        );
-
-        let p0 = self.primes[0];
-
-        (0..p0).into_par_iter().rev().for_each(|i| {
-            if stop.load(Ordering::Relaxed) {
-                return;
-            }
-
-            let mut key = vec![i];
-            let row_complement = &self.shift_table[0][i];
-            let base_mask = self.zero_mask.bitand(row_complement);
-            let count = base_mask.count_ones();
-
-            if count < self.limit {
-                return;
-            }
-
-            if depth == 1 {
-                max_count.fetch_max(count, Ordering::Relaxed);
-                if count == self.limit && !stop.swap(true, Ordering::Relaxed) {
-                    results.fetch_add(1, Ordering::Relaxed);
-                    shifts.lock().unwrap().push(key.clone());
-                    info!("target level=0 key={:?} count={}", key, count);
-                }
-                return;
-            }
-
-            let mut stack = vec![Frame {
-                level: 1,
-                base_mask,
-                next_idx: self.primes[1],
-                next_p: self.primes[1],
-            }];
-
-            while let Some(frame) = stack.last_mut() {
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
-
-                if frame.next_idx == 0 {
-                    stack.pop();
-                    if stack.last().is_some() {
-                        key.pop();
-                    }
-                    continue;
-                }
-
-                frame.next_idx -= 1;
-                let idx = frame.next_idx;
-                let level = frame.level;
-                let current_base = frame.base_mask.clone();
-
-                key.push(idx);
-                let n = node_count.fetch_add(1, Ordering::Relaxed) + 1;
-
-                let complement = &self.shift_table[level][idx];
-                let node_mask = current_base.bitand(complement);
-                let c_count = node_mask.count_ones();
-
-                if n % 10_000 == 0 {
-                    pb.set_position(n);
-                    pb.set_message(format!(
-                        "best: {} | hits: {} | depth: {}",
-                        max_count.load(Ordering::Relaxed),
-                        results.load(Ordering::Relaxed),
-                        key.len()
-                    ));
-                }
-
-                if c_count < self.limit {
-                    key.pop();
-                    continue;
-                }
-
-                if level + 1 >= depth {
-                    max_count.fetch_max(c_count, Ordering::Relaxed);
-                    if c_count == self.limit && !stop.swap(true, Ordering::Relaxed) {
-                        results.fetch_add(1, Ordering::Relaxed);
-                        shifts.lock().unwrap().push(key.clone());
-                        info!("target level={} key={:?} count={}", level, key, c_count);
-                    }
-                    if stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    key.pop();
-                    continue;
-                }
-
-                let next_p_child = self.primes[level + 1];
-                stack.push(Frame {
-                    level: level + 1,
-                    base_mask: node_mask,
-                    next_idx: next_p_child,
-                    next_p: next_p_child,
-                });
-            }
-        });
-
-        pb.finish_with_message("探索完了");
-
-        let final_shifts = shifts.lock().unwrap();
-        SharedResults {
-            max_count: max_count.load(Ordering::Relaxed),
-            results: results.load(Ordering::Relaxed),
-            shifts: final_shifts.clone(),
-        }
+        Ok(())
     }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    SimpleLogger::new()
-        .with_level(LevelFilter::Info)
-        .init()?;
-
+    SimpleLogger::new().with_level(LevelFilter::Info).init()?;
     let cli = Cli::parse();
-
     let all_primes = generate_primes(1579);
+
+    if let Err(message) = cli.validate(all_primes.len()) {
+        eprintln!("エラー: {}", message);
+        std::process::exit(1);
+    }
+
     let primes = match cli.primes_count {
         Some(cnt) => all_primes[..cnt].to_vec(),
         None => all_primes,
     };
-
-    if cli.depth > primes.len() {
-        eprintln!(
-            "エラー: depth ({}) が指定可能な素数の数 ({}) を超えています",
-            cli.depth,
-            primes.len()
-        );
-        std::process::exit(1);
-    }
 
     info!("HLSearch (Rust) 開始");
     info!(
@@ -504,24 +121,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let start_time = Instant::now();
     let shift_table = build_shift_table(&primes[..cli.depth], cli.cols);
-
-    let mut state = State::new(
-        primes,
-        cli.depth,
-        cli.limit,
-        cli.max_depth,
-        cli.target,
-        cli.cols,
-        shift_table,
-    );
+    let mut state = State::new(primes, cli.limit, cli.cols, shift_table);
 
     match cli.mode {
-        SearchMode::Sequential => {
-            info!("探索モード: sequential (search)");
-            state.search(cli.depth);
-        }
+        SearchMode::Sequential => state.search(cli.depth),
         SearchMode::Parallel => {
-            info!("探索モード: parallel (search_parallel)");
             let result = state.search_parallel(cli.depth);
             state.max_count = result.max_count;
             state.results = result.results;
@@ -534,7 +138,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("最大値: {}", state.max_count);
     info!("該当件数: {}", state.results);
 
-    // 結果の出力（ファイル名にタイムスタンプを付与）
     let output_path = with_timestamp(&cli.output);
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -543,7 +146,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut writer = BufWriter::new(file);
     info!("出力ファイル: {}", output_path.display());
 
-    // 実行時の設定を出力ファイルの先頭に記録
     writeln!(writer, "# ---- config ----")?;
     writeln!(writer, "mode:{:?}", cli.mode)?;
     writeln!(writer, "depth:{}", cli.depth)?;
@@ -560,7 +162,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     writeln!(writer, "elapsed:{:?}", elapsed)?;
     writeln!(writer, "# ---- result ----")?;
-
     writeln!(writer, "max_count:{}", state.max_count)?;
     writeln!(writer, "results:{}", state.results)?;
     for shift in &state.shifts {
@@ -569,4 +170,104 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("HLSearch 終了");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bitmask::BitMask;
+    use std::path::Path;
+
+    #[test]
+    fn generate_primes_handles_small_limits() {
+        assert_eq!(generate_primes(0), Vec::<usize>::new());
+        assert_eq!(generate_primes(1), Vec::<usize>::new());
+        assert_eq!(generate_primes(2), vec![2]);
+        assert_eq!(generate_primes(10), vec![2, 3, 5, 7]);
+    }
+
+    #[test]
+    fn bitmask_tracks_logical_size_and_popcount() {
+        let mut mask = BitMask::new_ones(65);
+        for idx in 0..65 {
+            mask.set(idx, false);
+        }
+        mask.set(0, true);
+        mask.set(64, true);
+        mask.set(65, true);
+        assert_eq!(mask.count_ones(), 2);
+        mask.set(0, false);
+        assert_eq!(mask.count_ones(), 1);
+    }
+
+    #[test]
+    fn build_shift_table_creates_expected_complement_masks() {
+        let table = build_shift_table(&[2], 6);
+        assert_eq!(table.len(), 1);
+        assert_eq!(table[0].len(), 2);
+        assert_eq!(table[0][0].count_ones(), 3);
+        assert_eq!(table[0][1].count_ones(), 3);
+    }
+
+    #[test]
+    fn timestamped_path_preserves_parent_and_extension() {
+        let path = with_timestamp(Path::new("results/shift_path.txt"));
+        let file_name = path.file_name().unwrap().to_str().unwrap();
+        assert_eq!(path.parent(), Some(Path::new("results")));
+        assert!(file_name.starts_with("shift_path_"));
+        assert!(file_name.ends_with(".txt"));
+    }
+
+    #[test]
+    fn sequential_and_parallel_search_find_valid_results() {
+        let primes = vec![2, 3];
+        let cols = 4;
+        let table = build_shift_table(&primes, cols);
+        let mut sequential = State::new(primes.clone(), 1, cols, table.clone());
+        sequential.search(2);
+        let parallel = State::new(primes.clone(), 1, cols, table);
+        let result = parallel.search_parallel(2);
+
+        assert_eq!(sequential.results, 1);
+        assert_eq!(result.results, 1);
+        assert_eq!(result.shifts.len(), 1);
+        assert_eq!(result.shifts[0].len(), 2);
+        for (level, &shift) in result.shifts[0].iter().enumerate() {
+            assert!(shift < primes[level]);
+        }
+    }
+
+    fn test_cli() -> Cli {
+        Cli {
+            depth: 1,
+            mode: SearchMode::Sequential,
+            limit: 1,
+            max_depth: 249,
+            target: 447,
+            cols: 4,
+            primes_count: None,
+            output: PathBuf::from("shift_path.txt"),
+        }
+    }
+
+    #[test]
+    fn cli_validation_accepts_valid_configuration() {
+        assert!(test_cli().validate(3).is_ok());
+    }
+
+    #[test]
+    fn cli_validation_rejects_invalid_configuration() {
+        let mut cli = test_cli();
+        cli.depth = 0;
+        assert!(cli.validate(3).is_err());
+        cli = test_cli();
+        cli.cols = 0;
+        assert!(cli.validate(3).is_err());
+        cli = test_cli();
+        cli.limit = 5;
+        assert!(cli.validate(3).is_err());
+        cli = test_cli();
+        cli.primes_count = Some(4);
+        assert!(cli.validate(3).is_err());
+    }
 }

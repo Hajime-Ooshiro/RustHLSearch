@@ -28,6 +28,33 @@ Windows 環境向けに `build.bat` も用意されています（デバッグ�
 build.bat
 ```
 
+## テスト・静的解析
+
+```bash
+# 単体テストをすべて実行
+cargo test
+
+# テスト名を指定して実行
+cargo test parallel_search_records_a_valid_matching_leaf
+
+# フォーマット確認
+cargo fmt -- --check
+
+# Clippy
+cargo clippy --all-targets --all-features -- -D warnings
+```
+
+## ソース構成
+
+```text
+src/
+  main.rs      # CLI解析、入力検証、探索実行、結果出力
+  bitmask.rs   # BitMaskによる64-bit単位のビット演算
+  primes.rs    # エラトステネスの篩による素数生成
+  search.rs    # シフトテーブル生成と逐次・並列DFS
+  output.rs    # タイムスタンプ付き出力パス生成
+```
+
 ## 実行
 
 ヘルプの表示:
@@ -58,6 +85,16 @@ cargo run --release -- --depth 10 --limit 400 --primes-count 100 -o result.txt
 
 > **Note**: 並列モード時のスレッド数は Rayon の既定値（論理コア数）となります。環境変数 `RAYON_NUM_THREADS` でスレッド数を指定可能です。
 
+### 入力値の検証
+
+実行開始前に次の条件を検証します。条件に違反した場合はエラーを表示して終了します。
+
+- `depth` は 1 以上
+- `cols` は 1 以上
+- `limit` は `cols` 以下
+- `primes-count` は 1 以上かつ利用可能な素数数以下
+- `depth` は使用する素数数以下
+
 ## 探索アルゴリズムの概要
 
 1. **素数生成**:
@@ -77,6 +114,8 @@ cargo run --release -- --depth 10 --limit 400 --primes-count 100 -o result.txt
 - `--mode parallel`（デフォルト）: 第1素数のシフト候補を逆順（降順）で Rayon の並列イテレータに分配し、複数スレッドで並列 DFS します。いずれかのスレッドが解を見つけた時点で全スレッドを停止します。
 - `--mode sequential`: 単一スレッドで決定論的に非再帰 DFS を実行します。
 
+並列モードではスレッドの実行順序により、記録される解のシフト列が逐次モードと異なる場合があります。どちらのモードも、最初に見つかった `limit` 一致の解を1件記録して探索を終了します。
+
 ## コマンドラインオプション
 
 | フラグ | 短縮 | 既定値 | 説明 |
@@ -87,10 +126,10 @@ cargo run --release -- --depth 10 --limit 400 --primes-count 100 -o result.txt
 | `--cols` | | `3159` | ビット列の長さ |
 | `--primes-count` | | 全素数 (249) | 使用する素数の最大個数制限 |
 | `--output` | `-o` | `shift_path.txt` | 出力ファイルパス（実行時にタイムスタンプが挿入されます） |
-| `--max-depth` | | `249` | 予約パラメータ（出力設定に記録） |
-| `--target` | `-t` | `447` | 予約パラメータ（出力設定に記録） |
+| `--max-depth` | | `249` | 出力設定に記録される予約パラメータ |
+| `--target` | `-t` | `447` | 出力設定に記録される予約パラメータ |
 
-> **Note**: `depth` が使用可能な素数の個数を超えている場合はエラーで終了します。
+> **Note**: `--max-depth` と `--target` は現在の探索条件には影響せず、実行設定として出力ファイルに記録されます。
 
 ## 出力ファイル形式
 
@@ -114,8 +153,8 @@ results:1
 [1, 1, 4, 3, 5, 10, 1, 9]
 ```
 
-- `max_count`: 探索中に到達した葉ノードの最大 popcount
-- `results`: `limit` にヒットした解の個数（見つかった場合は 1、見つからなかった場合は 0）
+- `max_count`: 早期終了までに到達した葉ノードの最大 popcount
+- `results`: 最初に `limit` にヒットした解の個数（見つかった場合は 1、見つからなかった場合は 0）
 - 解が見つかった場合、最終行にそのシフト列（配列）が出力されます。
 
 ## ライセンス

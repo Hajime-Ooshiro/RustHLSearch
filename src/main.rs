@@ -157,6 +157,7 @@ pub fn build_shift_table(primes: &[usize], cols: usize) -> Vec<Vec<BitMask>> {
 struct Frame {
     level: usize,
     base_mask: BitMask,
+    /// 未探索の次インデックス（降順）。`next_p` で初期化し、0 でその階層を終了する
     next_idx: usize,
     next_p: usize,
 }
@@ -270,12 +271,12 @@ impl State {
         let mut stack = vec![Frame {
             level: 0,
             base_mask: self.zero_mask.clone(),
-            next_idx: 0,
+            next_idx: self.primes[0],
             next_p: self.primes[0],
         }];
 
         while let Some(frame) = stack.last_mut() {
-            if frame.next_idx >= frame.next_p {
+            if frame.next_idx == 0 {
                 stack.pop();
                 if let Some(parent) = stack.last() {
                     self.key.pop();
@@ -284,10 +285,10 @@ impl State {
                 continue;
             }
 
+            frame.next_idx -= 1;
             let i = frame.next_idx;
             let level = frame.level;
             let base_mask = frame.base_mask.clone();
-            frame.next_idx += 1;
 
             self.key.push(i);
             self.node_count += 1;
@@ -332,7 +333,7 @@ impl State {
             stack.push(Frame {
                 level: level + 1,
                 base_mask: node_mask,
-                next_idx: 0,
+                next_idx: next_p_child,
                 next_p: next_p_child,
             });
         }
@@ -362,7 +363,7 @@ impl State {
 
         let p0 = self.primes[0];
 
-        (0..p0).into_par_iter().for_each(|i| {
+        (0..p0).into_par_iter().rev().for_each(|i| {
             if stop.load(Ordering::Relaxed) {
                 return;
             }
@@ -389,7 +390,7 @@ impl State {
             let mut stack = vec![Frame {
                 level: 1,
                 base_mask,
-                next_idx: 0,
+                next_idx: self.primes[1],
                 next_p: self.primes[1],
             }];
 
@@ -398,7 +399,7 @@ impl State {
                     break;
                 }
 
-                if frame.next_idx >= frame.next_p {
+                if frame.next_idx == 0 {
                     stack.pop();
                     if stack.last().is_some() {
                         key.pop();
@@ -406,10 +407,10 @@ impl State {
                     continue;
                 }
 
+                frame.next_idx -= 1;
                 let idx = frame.next_idx;
                 let level = frame.level;
                 let current_base = frame.base_mask.clone();
-                frame.next_idx += 1;
 
                 key.push(idx);
                 let n = node_count.fetch_add(1, Ordering::Relaxed) + 1;
@@ -451,7 +452,7 @@ impl State {
                 stack.push(Frame {
                     level: level + 1,
                     base_mask: node_mask,
-                    next_idx: 0,
+                    next_idx: next_p_child,
                     next_p: next_p_child,
                 });
             }

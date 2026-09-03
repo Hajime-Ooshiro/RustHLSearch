@@ -1,75 +1,123 @@
 # RustHLSearch
 
-HLSearch（素数シフト探索）の Rust 実装です。指定深さまでのシフト列を DFS し、葉のビット数が `limit` に一致する最初のパスを記録して探索を終了します。葉で観測した popcount の最大値は `max_count` として別途保持します。
+HLSearch（素数シフト探索）の Rust 実装です。指定した深さまでの素数シフト列を深さ優先探索（DFS）し、葉のビット数（popcount）が `limit` に一致する最初のパスを記録して探索を即座に終了します。葉で観測した popcount の最大値は `max_count` として記録されます。
+
+## 機能・特徴
+
+- **高速なビット並列処理**: 64-bit 単位の独自 `BitMask` 構造体による高速 bitwise AND および popcount。
+- **並列 DFS（Rayon）**: 第1素数のシフトを並列分散し、マルチコア CPU をフル活用。
+- **早期打ち切り**: いずれかのスレッドで `limit` 一致解が検出された瞬間、アトミックフラグにより全スレッドの探索を停止。
+- **降順探索**: 各素数のシフト候補を降順（$p-1 \dots 0$）に探索。
+- **リアルタイム進捗表示**: `indicatif` による探索ノード数・処理速度・最良 popcount のライブ表示。
 
 ## ビルド
+
+### Cargo によるビルド
 
 ```bash
 cargo build --release
 ```
 
-バイナリは `target/release/hlsearch`（Windows では `hlsearch.exe`）です。
+バイナリは `target/release/hlsearch`（Windows では `target/release/hlsearch.exe`）に出力されます。
+
+### Windows 用バッチファイル
+
+Windows 環境向けに `build.bat` も用意されています（デバッグビルドおよびリリースビルドを順に実行）。
+
+```cmd
+build.bat
+```
 
 ## 実行
+
+ヘルプの表示:
 
 ```bash
 cargo run --release -- --help
 ```
 
-デフォルトは並列探索です。
+### 実行例
+
+デフォルト（並列モード、深さ 8、limit 447、cols 3159）:
 
 ```bash
 cargo run --release
+```
+
+逐次モード（単一スレッド）で実行:
+
+```bash
 cargo run --release -- --mode sequential --depth 8 --limit 447
 ```
 
-スレッド数は Rayon の既定（環境変数 `RAYON_NUM_THREADS`）に従います。
+素数の個数や出力先を指定して実行:
 
-## 探索の動き
-
-1. 1579 以下の素数を生成し、先頭から `depth` 個を階層に使う（`--primes-count` で個数を制限可能）。
-2. 各素数 `p` とシフト `k = 0..p` について、列長 `cols` の補集合ビットマスクを作る。
-3. マスクを AND しながら非再帰 DFS する。popcount が `limit` 未満のノードは枝刈りする。
-4. 深さ `depth` の葉で:
-   - popcount がこれまでの最大なら `max_count` を更新する（パスは保存しない）
-   - popcount が `limit` と一致したらそのシフト列を 1 件記録し、**探索全体を打ち切る**
-
-`--mode sequential` は単一スレッド DFS の出現順で最初のヒットです。`--mode parallel` は第 1 素数のシフトで分岐し、先にヒットしたスレッドが記録します（出現順は逐次と一致しません）。
-
-`--max-depth` と `--target` は CLI と出力ファイルの config に残していますが、現在の探索ロジックでは未使用です。
-
-## オプション
-
-| フラグ | 既定 | 意味 |
-| --- | --- | --- |
-| `-d`, `--depth` | `8` | 探索する階層数 |
-| `-m`, `--mode` | `parallel` | `sequential` または `parallel` |
-| `-l`, `--limit` | `447` | 枝刈り下限、かつ記録する葉の popcount |
-| `--max-depth` | `249` | 未使用（config に記録） |
-| `-t`, `--target` | `447` | 未使用（config に記録） |
-| `--cols` | `3159` | ビット列の長さ |
-| `--primes-count` | 全素数 | 使用する素数の個数 |
-| `-o`, `--output` | `shift_path.txt` | 出力パス（タイムスタンプを挿入） |
-
-`depth` が使用可能な素数の個数を超えるとエラー終了します。
-
-## 出力
-
-ファイル名は `shift_path.txt` なら `shift_path_YYYYMMDD_HHMMSS.txt` のようになります。先頭に実行時設定、続けて結果を書きます。
-
+```bash
+cargo run --release -- --depth 10 --limit 400 --primes-count 100 -o result.txt
 ```
+
+> **Note**: 並列モード時のスレッド数は Rayon の既定値（論理コア数）となります。環境変数 `RAYON_NUM_THREADS` でスレッド数を指定可能です。
+
+## 探索アルゴリズムの概要
+
+1. **素数生成**:
+   - 1579 以下の素数（最大 249 個）をエラトステネスの篩で生成し、先頭から `depth` 個を探索階層に使用します（`--primes-count` で上限指定可能）。
+2. **補集合シフトテーブル作成**:
+   - 各素数 $p$ とシフト $k \in [0, p)$ について、長さ `cols` の補集合ビットマスクを事前構築します。
+3. **深さ優先探索 (DFS)**:
+   - マスクを AND 演算しながら非再帰（スタック）DFS を行います。
+   - 途中の累積 popcount が `limit` 未満になった枝は即座に枝刈り（pruning）します。
+   - 各素数のシフト探索は降順（$p-1 \dots 0$）に進めます。
+4. **葉ノード（深さ `depth`）の判定**:
+   - popcount がこれまでの最大値を超えた場合、`max_count` を更新します。
+   - popcount が `limit` と一致した場合、そのシフトパスを記録して**探索全体を打ち切り終了**します。
+
+### 探索モード
+
+- `--mode parallel`（デフォルト）: 第1素数のシフト候補を逆順（降順）で Rayon の並列イテレータに分配し、複数スレッドで並列 DFS します。いずれかのスレッドが解を見つけた時点で全スレッドを停止します。
+- `--mode sequential`: 単一スレッドで決定論的に非再帰 DFS を実行します。
+
+## コマンドラインオプション
+
+| フラグ | 短縮 | 既定値 | 説明 |
+| --- | --- | --- | --- |
+| `--depth` | `-d` | `8` | 探索する階層数（使用する素数の個数） |
+| `--mode` | `-m` | `parallel` | 探索モード（`parallel` または `sequential`） |
+| `--limit` | `-l` | `447` | 枝刈り下限値、かつ探索完了・記録対象とする葉の popcount |
+| `--cols` | | `3159` | ビット列の長さ |
+| `--primes-count` | | 全素数 (249) | 使用する素数の最大個数制限 |
+| `--output` | `-o` | `shift_path.txt` | 出力ファイルパス（実行時にタイムスタンプが挿入されます） |
+| `--max-depth` | | `249` | 予約パラメータ（出力設定に記録） |
+| `--target` | `-t` | `447` | 予約パラメータ（出力設定に記録） |
+
+> **Note**: `depth` が使用可能な素数の個数を超えている場合はエラーで終了します。
+
+## 出力ファイル形式
+
+出力ファイル名には実行時のタイムスタンプが付与されます（例: `shift_path.txt` の場合 `shift_path_YYYYMMDD_HHMMSS.txt`）。
+
+ファイル先頭に実行時設定（config）、続いて探索結果（result）が出力されます。
+
+```text
 # ---- config ----
 mode:Parallel
 depth:8
-...
+limit:447
+max_depth:249
+target:447
+cols:3159
+primes_count:all
+elapsed:1.234567s
 # ---- result ----
-max_count:<葉で見た最大 popcount>
-results:<limit ヒット件数（0 または 1）>
-[0, 1, 2, ...]
+max_count:447
+results:1
+[1, 1, 4, 3, 5, 10, 1, 9]
 ```
 
-パス行はヒットしたときだけ付きます。
+- `max_count`: 探索中に到達した葉ノードの最大 popcount
+- `results`: `limit` にヒットした解の個数（見つかった場合は 1、見つからなかった場合は 0）
+- 解が見つかった場合、最終行にそのシフト列（配列）が出力されます。
 
 ## ライセンス
 
-MIT License
+[MIT License](LICENSE)

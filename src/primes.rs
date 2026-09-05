@@ -24,3 +24,16 @@ pub fn generate_primes(limit: usize) -> Vec<usize> {
         .filter_map(|(n, &p)| if p { Some(n) } else { None })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::generate_primes;
+
+    #[test]
+    fn handles_small_limits() {
+        assert_eq!(generate_primes(0), Vec::<usize>::new());
+        assert_eq!(generate_primes(1), Vec::<usize>::new());
+        assert_eq!(generate_primes(2), vec![2]);
+        assert_eq!(generate_primes(10), vec![2, 3, 5, 7]);
+    }
+}

@@ -80,7 +80,7 @@ cargo run --release -- --mode sequential --depth 8 --limit 447
 素数の個数や出力先を指定して実行:
 
 ```bash
-cargo run --release -- --depth 10 --limit 400 --primes-count 100 -o result.txt
+cargo run --release -- --depth 10 --limit 400 --primes-count 100 -o result.json
 ```
 
 > **Note**: 並列モード時のスレッド数は Rayon の既定値（論理コア数）となります。環境変数 `RAYON_NUM_THREADS` でスレッド数を指定可能です。
@@ -125,7 +125,7 @@ cargo run --release -- --depth 10 --limit 400 --primes-count 100 -o result.txt
 | `--limit` | `-l` | `447` | 枝刈り下限値、かつ探索完了・記録対象とする葉の popcount |
 | `--cols` | | `3159` | ビット列の長さ |
 | `--primes-count` | | 全素数 (249) | 使用する素数の最大個数制限 |
-| `--output` | `-o` | `shift_path.txt` | 出力ファイルパス（実行時にタイムスタンプが挿入されます） |
+| `--output` | `-o` | `shift_path.json` | JSON出力ファイルパス（実行時にタイムスタンプが挿入されます） |
 | `--max-depth` | | `249` | 出力設定に記録される予約パラメータ |
 | `--target` | `-t` | `447` | 出力設定に記録される予約パラメータ |
 
@@ -133,29 +133,34 @@ cargo run --release -- --depth 10 --limit 400 --primes-count 100 -o result.txt
 
 ## 出力ファイル形式
 
-出力ファイル名には実行時のタイムスタンプが付与されます（例: `shift_path.txt` の場合 `shift_path_YYYYMMDD_HHMMSS.txt`）。
+出力ファイル名には実行時のタイムスタンプが付与されます（例: `shift_path.json` の場合 `shift_path_YYYYMMDD_HHMMSS.json`）。
 
-ファイル先頭に実行時設定（config）、続いて探索結果（result）が出力されます。
+ファイルには実行時設定（`config`）と探索結果（`result`）を含むJSONオブジェクトが出力されます。
 
-```text
-# ---- config ----
-mode:Parallel
-depth:8
-limit:447
-max_depth:249
-target:447
-cols:3159
-primes_count:all
-elapsed:1.234567s
-# ---- result ----
-max_count:447
-results:1
-[1, 1, 4, 3, 5, 10, 1, 9]
+```json
+{
+  "config": {
+    "mode": "parallel",
+    "depth": 8,
+    "limit": 447,
+    "max_depth": 249,
+    "target": 447,
+    "cols": 3159,
+    "primes_count": "all",
+    "elapsed": "1.234567s"
+  },
+  "result": {
+    "max_count": 447,
+    "results": 1,
+    "shifts": [[1, 1, 4, 3, 5, 10, 1, 9]]
+  }
+}
 ```
 
-- `max_count`: 早期終了までに到達した葉ノードの最大 popcount
-- `results`: 最初に `limit` にヒットした解の個数（見つかった場合は 1、見つからなかった場合は 0）
-- 解が見つかった場合、最終行にそのシフト列（配列）が出力されます。
+- `config`: 実行時設定と経過時間
+- `result.max_count`: 早期終了までに到達した葉ノードの最大 popcount
+- `result.results`: 最初に `limit` にヒットした解の個数（見つかった場合は 1、見つからなかった場合は 0）
+- `result.shifts`: 見つかったシフト列の配列
 
 ## ライセンス
 

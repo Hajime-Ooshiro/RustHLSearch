@@ -8,11 +8,37 @@ use log::{info, LevelFilter};
 use output::with_timestamp;
 use primes::generate_primes;
 use search::{build_shift_table, SearchMode, State};
+use serde::Serialize;
 use simple_logger::SimpleLogger;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::time::Instant;
+
+#[derive(Serialize)]
+struct OutputFile<'a> {
+    config: OutputConfig<'a>,
+    result: OutputResult<'a>,
+}
+
+#[derive(Serialize)]
+struct OutputConfig<'a> {
+    mode: &'a str,
+    depth: usize,
+    limit: usize,
+    max_depth: usize,
+    target: usize,
+    cols: usize,
+    primes_count: &'a str,
+    elapsed: String,
+}
+
+#[derive(Serialize)]
+struct OutputResult<'a> {
+    max_count: usize,
+    results: usize,
+    shifts: &'a [Vec<usize>],
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "HLSearch: 素数シフト探索プログラム (Rust版)", long_about = None)]
@@ -47,7 +73,7 @@ pub struct Cli {
     #[arg(
         short,
         long,
-        default_value = "shift_path.txt",
+        default_value = "shift_path.json",
         help = "出力ファイルパス"
     )]
     pub output: PathBuf,
@@ -122,6 +148,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start_time = Instant::now();
     let shift_table = build_shift_table(&primes[..cli.depth], cli.cols);
     let mut state = State::new(primes, cli.limit, cli.cols, shift_table);
+    state.max_depth = cli.max_depth;
+    state.target = cli.target;
 
     match cli.mode {
         SearchMode::Sequential => state.search(cli.depth),
@@ -146,27 +174,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut writer = BufWriter::new(file);
     info!("出力ファイル: {}", output_path.display());
 
-    writeln!(writer, "# ---- config ----")?;
-    writeln!(writer, "mode:{:?}", cli.mode)?;
-    writeln!(writer, "depth:{}", cli.depth)?;
-    writeln!(writer, "limit:{}", cli.limit)?;
-    writeln!(writer, "max_depth:{}", cli.max_depth)?;
-    writeln!(writer, "target:{}", cli.target)?;
-    writeln!(writer, "cols:{}", cli.cols)?;
-    writeln!(
-        writer,
-        "primes_count:{}",
-        cli.primes_count
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "all".to_string())
-    )?;
-    writeln!(writer, "elapsed:{:?}", elapsed)?;
-    writeln!(writer, "# ---- result ----")?;
-    writeln!(writer, "max_count:{}", state.max_count)?;
-    writeln!(writer, "results:{}", state.results)?;
-    for shift in &state.shifts {
-        writeln!(writer, "{:?}", shift)?;
-    }
+    let primes_count = cli
+        .primes_count
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "all".to_string());
+    let output = OutputFile {
+        config: OutputConfig {
+            mode: match cli.mode {
+                SearchMode::Sequential => "sequential",
+                SearchMode::Parallel => "parallel",
+            },
+            depth: cli.depth,
+            limit: cli.limit,
+            max_depth: cli.max_depth,
+            target: cli.target,
+            cols: cli.cols,
+            primes_count: &primes_count,
+            elapsed: format!("{elapsed:?}"),
+        },
+        result: OutputResult {
+            max_count: state.max_count,
+            results: state.results,
+            shifts: &state.shifts,
+        },
+    };
+    serde_json::to_writer_pretty(&mut writer, &output)?;
+    writeln!(writer)?;
 
     info!("HLSearch 終了");
     Ok(())
@@ -175,67 +208,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bitmask::BitMask;
-    use std::path::Path;
-
-    #[test]
-    fn generate_primes_handles_small_limits() {
-        assert_eq!(generate_primes(0), Vec::<usize>::new());
-        assert_eq!(generate_primes(1), Vec::<usize>::new());
-        assert_eq!(generate_primes(2), vec![2]);
-        assert_eq!(generate_primes(10), vec![2, 3, 5, 7]);
-    }
-
-    #[test]
-    fn bitmask_tracks_logical_size_and_popcount() {
-        let mut mask = BitMask::new_ones(65);
-        for idx in 0..65 {
-            mask.set(idx, false);
-        }
-        mask.set(0, true);
-        mask.set(64, true);
-        mask.set(65, true);
-        assert_eq!(mask.count_ones(), 2);
-        mask.set(0, false);
-        assert_eq!(mask.count_ones(), 1);
-    }
-
-    #[test]
-    fn build_shift_table_creates_expected_complement_masks() {
-        let table = build_shift_table(&[2], 6);
-        assert_eq!(table.len(), 1);
-        assert_eq!(table[0].len(), 2);
-        assert_eq!(table[0][0].count_ones(), 3);
-        assert_eq!(table[0][1].count_ones(), 3);
-    }
-
-    #[test]
-    fn timestamped_path_preserves_parent_and_extension() {
-        let path = with_timestamp(Path::new("results/shift_path.txt"));
-        let file_name = path.file_name().unwrap().to_str().unwrap();
-        assert_eq!(path.parent(), Some(Path::new("results")));
-        assert!(file_name.starts_with("shift_path_"));
-        assert!(file_name.ends_with(".txt"));
-    }
-
-    #[test]
-    fn sequential_and_parallel_search_find_valid_results() {
-        let primes = vec![2, 3];
-        let cols = 4;
-        let table = build_shift_table(&primes, cols);
-        let mut sequential = State::new(primes.clone(), 1, cols, table.clone());
-        sequential.search(2);
-        let parallel = State::new(primes.clone(), 1, cols, table);
-        let result = parallel.search_parallel(2);
-
-        assert_eq!(sequential.results, 1);
-        assert_eq!(result.results, 1);
-        assert_eq!(result.shifts.len(), 1);
-        assert_eq!(result.shifts[0].len(), 2);
-        for (level, &shift) in result.shifts[0].iter().enumerate() {
-            assert!(shift < primes[level]);
-        }
-    }
 
     fn test_cli() -> Cli {
         Cli {

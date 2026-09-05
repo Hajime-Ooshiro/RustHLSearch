@@ -52,3 +52,22 @@ impl BitMask {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::BitMask;
+
+    #[test]
+    fn tracks_logical_size_and_popcount() {
+        let mut mask = BitMask::new_ones(65);
+        for idx in 0..65 {
+            mask.set(idx, false);
+        }
+        mask.set(0, true);
+        mask.set(64, true);
+        mask.set(65, true);
+        assert_eq!(mask.count_ones(), 2);
+        mask.set(0, false);
+        assert_eq!(mask.count_ones(), 1);
+    }
+}

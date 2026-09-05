@@ -53,6 +53,8 @@ pub struct SharedResults {
 pub struct State {
     pub primes: Vec<usize>,
     pub limit: usize,
+    pub max_depth: usize,
+    pub target: usize,
     pub key: Vec<usize>,
     pub zero_mask: BitMask,
     pub max_count: usize,
@@ -72,6 +74,8 @@ impl State {
         State {
             primes,
             limit,
+            max_depth: 249,
+            target: 447,
             key: Vec::new(),
             zero_mask: BitMask::new_ones(cols),
             max_count: 0,
@@ -125,14 +129,29 @@ impl State {
                 continue;
             }
 
+            if count < self.max_count {
+                self.key.pop();
+                continue;
+            }
+
             if level + 1 >= depth {
-                self.max_count = self.max_count.max(count);
-                if count == self.limit {
-                    self.results += 1;
-                    self.shifts.push(self.key.clone());
-                    info!("target level={} key={:?} count={}", level, self.key, count);
-                    self.key.pop();
-                    break;
+                if depth == self.max_depth {
+                    if count == self.target {
+                        self.results += 1;
+                        self.shifts.push(self.key.clone());
+                        info!("target level={} key={:?} count={}", level, self.key, count);
+                        self.key.pop();
+                        break;
+                    }
+                    if count > self.max_count {
+                        self.max_count = count;
+                        self.shifts.clear();
+                        self.shifts.push(self.key.clone());
+                        info!("best level={} key={:?} count={}", level, self.key, count);
+                    } else if count == self.max_count {
+                        self.shifts.push(self.key.clone());
+                        info!("best level={} key={:?} count={}", level, self.key, count);
+                    }
                 }
                 self.key.pop();
                 continue;
@@ -221,8 +240,12 @@ impl State {
                     continue;
                 }
 
+                if c_count < max_count.load(Ordering::Relaxed) {
+                    key.pop();
+                    continue;
+                }
+
                 if level + 1 >= depth {
-                    max_count.fetch_max(c_count, Ordering::Relaxed);
                     if c_count == self.limit && !stop.swap(true, Ordering::Relaxed) {
                         results.fetch_add(1, Ordering::Relaxed);
                         shifts.lock().unwrap().push(key.clone());
@@ -233,6 +256,18 @@ impl State {
                     }
                     key.pop();
                     continue;
+                }
+
+                if depth == self.max_depth {
+                    if c_count > max_count.load(Ordering::Relaxed) {
+                        max_count.store(c_count, Ordering::Relaxed);
+                        shifts.lock().unwrap().clear();
+                        shifts.lock().unwrap().push(key.clone());
+                        info!("best level={} key={:?} count={}", level, key, c_count);
+                    } else if c_count == max_count.load(Ordering::Relaxed) {
+                        shifts.lock().unwrap().push(key.clone());
+                        info!("best level={} key={:?} count={}", level, key, c_count);
+                    }
                 }
 
                 stack.push(Frame {
@@ -261,4 +296,41 @@ fn progress_bar() -> ProgressBar {
             .unwrap(),
     );
     pb
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_shift_table, State};
+
+    #[test]
+    fn build_shift_table_creates_expected_complement_masks() {
+        let table = build_shift_table(&[2], 6);
+        assert_eq!(table.len(), 1);
+        assert_eq!(table[0].len(), 2);
+        assert_eq!(table[0][0].count_ones(), 3);
+        assert_eq!(table[0][1].count_ones(), 3);
+    }
+
+    #[test]
+    fn sequential_and_parallel_search_find_valid_results() {
+        let primes = vec![2, 3];
+        let cols = 4;
+        let table = build_shift_table(&primes, cols);
+        let mut sequential = State::new(primes.clone(), 1, cols, table.clone());
+        sequential.max_depth = 2;
+        sequential.target = 1;
+        sequential.search(2);
+        let mut parallel = State::new(primes.clone(), 1, cols, table);
+        parallel.max_depth = 2;
+        parallel.target = 1;
+        let result = parallel.search_parallel(2);
+
+        assert_eq!(sequential.results, 1);
+        assert_eq!(result.results, 1);
+        assert_eq!(result.shifts.len(), 1);
+        assert_eq!(result.shifts[0].len(), 2);
+        for (level, &shift) in result.shifts[0].iter().enumerate() {
+            assert!(shift < primes[level]);
+        }
+    }
 }

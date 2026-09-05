@@ -22,3 +22,18 @@ pub fn with_timestamp(path: &Path) -> PathBuf {
         _ => PathBuf::from(new_name),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::with_timestamp;
+    use std::path::Path;
+
+    #[test]
+    fn timestamped_path_preserves_parent_and_extension() {
+        let path = with_timestamp(Path::new("results/shift_path.json"));
+        let file_name = path.file_name().unwrap().to_str().unwrap();
+        assert_eq!(path.parent(), Some(Path::new("results")));
+        assert!(file_name.starts_with("shift_path_"));
+        assert!(file_name.ends_with(".json"));
+    }
+}

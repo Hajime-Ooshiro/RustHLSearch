@@ -84,7 +84,15 @@ cargo run --release -- --mode sequential --depth 8 --limit 447
 cargo run --release -- --mode sequential
 ```
 
-逐次モードでは 10,000 ノードごとに `探索経過` をログへ出力し、DFS のスタックと集計値を `checkpoint.json` に自動保存します。起動時に `checkpoint.json` が存在すれば自動的に読み込んで続行し、探索が正常終了すると `searched_YYYYMMDD_HHMMSS.json` に改名します。チェックポイント機能は探索順序を保てる逐次モード専用です。
+逐次モードでは 100,000 ノードごとに `探索経過` をログへ出力し、DFS のスタックと集計値を `checkpoint.json` に自動保存します。起動時に `checkpoint.json` が存在すれば自動的に読み込んで続行し、探索が正常終了すると `searched_YYYYMMDD_HHMMSS.json` に改名します。チェックポイント機能は探索順序を保てる逐次モード専用です。
+
+チェックポイント保存周期を変更する場合:
+
+```bash
+cargo run --release -- --mode sequential --checkpoint-interval 50000
+```
+
+`--checkpoint-interval` でノード数を指定できます（デフォルト: 100,000）。
 
 素数の個数や出力先を指定して実行:
 
@@ -135,6 +143,7 @@ cargo run --release -- --depth 10 --limit 400 --primes-count 100 -o result.json
 | `--cols` | | `3159` | ビット列の長さ |
 | `--primes-count` | | 全素数 (249) | 使用する素数の最大個数制限 |
 | `--output` | `-o` | `shift_path.json` | JSON出力ファイルパス（実行時にタイムスタンプが挿入されます） |
+| `--checkpoint-interval` | | `100000` | チェックポイント保存周期 (ノード数) |
 | `--max-depth` | | `249` | 出力設定に記録される予約パラメータ |
 | `--target` | `-t` | `447` | 出力設定に記録される予約パラメータ |
 

@@ -84,6 +84,7 @@ pub struct State {
     pub results: usize,
     pub shifts: Vec<Vec<usize>>,
     pub node_count: u64,
+    pub checkpoint_interval: u64,
     shift_table: Vec<Vec<BitMask>>,
 }
 
@@ -105,6 +106,7 @@ impl State {
             results: 0,
             shifts: Vec::new(),
             node_count: 0,
+            checkpoint_interval: 100_000,
             shift_table,
         }
     }
@@ -176,7 +178,7 @@ impl State {
             let node_mask = base_mask.bitand(&self.shift_table[level][i]);
             let count = node_mask.count_ones();
 
-            if self.node_count.is_multiple_of(10_000) {
+            if self.node_count.is_multiple_of(self.checkpoint_interval) {
                 pb.set_position(self.node_count);
                 pb.set_message(format!(
                     "best: {} | hits: {} | depth: {}",
@@ -369,7 +371,7 @@ impl State {
                 let node_mask = current_base.bitand(&self.shift_table[level][idx]);
                 let c_count = node_mask.count_ones();
 
-                if n.is_multiple_of(10_000) {
+                if n.is_multiple_of(self.checkpoint_interval) {
                     pb.set_position(n);
                     pb.set_message(format!(
                         "best: {} | hits: {} | depth: {}",

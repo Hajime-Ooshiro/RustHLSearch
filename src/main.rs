@@ -79,6 +79,13 @@ pub struct Cli {
         help = "出力ファイルパス"
     )]
     pub output: PathBuf,
+
+    #[arg(
+        long,
+        default_value_t = 100_000,
+        help = "チェックポイント保存周期 (ノード数)"
+    )]
+    pub checkpoint_interval: u64,
 }
 
 impl Cli {
@@ -152,6 +159,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut state = State::new(primes, cli.limit, cli.cols, shift_table);
     state.max_depth = cli.max_depth;
     state.target = cli.target;
+    state.checkpoint_interval = cli.checkpoint_interval;
 
     match cli.mode {
         SearchMode::Sequential => {
@@ -237,6 +245,7 @@ mod tests {
             cols: 4,
             primes_count: None,
             output: PathBuf::from("shift_path.txt"),
+            checkpoint_interval: 100_000,
         }
     }
 

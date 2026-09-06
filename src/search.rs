@@ -41,14 +41,19 @@ struct Frame {
 }
 
 #[derive(Deserialize, Serialize)]
+struct StackFrame {
+    level: usize,
+    next_idx: usize,
+}
+
+#[derive(Deserialize, Serialize)]
 struct Checkpoint {
     depth: usize,
     primes: Vec<usize>,
     limit: usize,
     cols: usize,
-    stack: Vec<Frame>,
+    stack: Vec<StackFrame>,
     key: Vec<usize>,
-    zero_mask: BitMask,
     max_count: usize,
     results: usize,
     shifts: Vec<Vec<usize>>,
@@ -124,19 +129,22 @@ impl State {
                 )
                 .into());
             }
-            self.key = checkpoint.key;
-            self.zero_mask = checkpoint.zero_mask;
+            self.key = checkpoint.key.clone();
             self.max_count = checkpoint.max_count;
             self.results = checkpoint.results;
             self.shifts = checkpoint.shifts;
             self.node_count = checkpoint.node_count;
-            info!("チェックポイントから探索を再開しました");
-            checkpoint.stack
+            info!(
+                "チェックポイントから探索を再開しました (nodes={})",
+                checkpoint.node_count
+            );
+
+            self.rebuild_stack_and_masks(&checkpoint.stack)?
         } else {
             vec![Frame {
-            level: 0,
-            base_mask: self.zero_mask.clone(),
-            next_idx: self.primes[0],
+                level: 0,
+                base_mask: self.zero_mask.clone(),
+                next_idx: self.primes[0],
             }]
         };
         let mut checkpoint_due = false;
@@ -243,14 +251,20 @@ impl State {
             }
         }
         let temporary_path = path.with_extension("tmp");
+        let stack_frames = stack
+            .iter()
+            .map(|f| StackFrame {
+                level: f.level,
+                next_idx: f.next_idx,
+            })
+            .collect();
         let checkpoint = Checkpoint {
             depth,
             primes: self.primes.clone(),
             limit: self.limit,
             cols: self.zero_mask.size(),
-            stack: stack.to_vec(),
+            stack: stack_frames,
             key: self.key.clone(),
-            zero_mask: self.zero_mask.clone(),
             max_count: self.max_count,
             results: self.results,
             shifts: self.shifts.clone(),
@@ -263,6 +277,38 @@ impl State {
         }
         fs::rename(temporary_path, path)?;
         Ok(())
+    }
+
+    fn rebuild_stack_and_masks(
+        &mut self,
+        saved_stack: &[StackFrame],
+    ) -> Result<Vec<Frame>, Box<dyn std::error::Error>> {
+        let mut stack = Vec::new();
+
+        let mut masks = vec![self.zero_mask.clone()];
+        for (level, &shift_idx) in self.key.iter().enumerate() {
+            let new_mask = masks[level].bitand(&self.shift_table[level][shift_idx]);
+            masks.push(new_mask);
+        }
+
+        for frame in saved_stack {
+            let base_mask = masks
+                .get(frame.level)
+                .cloned()
+                .ok_or("Invalid stack frame level")?;
+            stack.push(Frame {
+                level: frame.level,
+                base_mask,
+                next_idx: frame.next_idx,
+            });
+        }
+
+        self.zero_mask = masks
+            .last()
+            .cloned()
+            .unwrap_or_else(|| self.zero_mask.clone());
+
+        Ok(stack)
     }
 
     pub fn search_parallel(&self, depth: usize) -> SharedResults {

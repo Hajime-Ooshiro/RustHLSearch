@@ -84,7 +84,7 @@ cargo run --release -- --mode sequential --depth 8 --limit 447
 cargo run --release -- --mode sequential
 ```
 
-逐次モードでは 10,000 ノードごとに `探索経過` をログへ出力し、DFS のスタックと集計値を `checkpoint.json` に自動保存します。起動時に `checkpoint.json` が存在すれば自動的に読み込んで続行し、探索が正常終了すると `searched.json` に変更します。チェックポイント機能は探索順序を保てる逐次モード専用です。
+逐次モードでは 10,000 ノードごとに `探索経過` をログへ出力し、DFS のスタックと集計値を `checkpoint.json` に自動保存します。起動時に `checkpoint.json` が存在すれば自動的に読み込んで続行し、探索が正常終了すると `searched_YYYYMMDD_HHMMSS.json` に改名します。チェックポイント機能は探索順序を保てる逐次モード専用です。
 
 素数の個数や出力先を指定して実行:
 

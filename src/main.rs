@@ -16,7 +16,6 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const CHECKPOINT_PATH: &str = "checkpoint.json";
-const SEARCHED_PATH: &str = "searched.json";
 
 #[derive(Serialize)]
 struct OutputFile<'a> {
@@ -159,10 +158,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let checkpoint_path = Path::new(CHECKPOINT_PATH);
             let resume_path = checkpoint_path.exists().then_some(checkpoint_path);
             state.search_with_checkpoint(cli.depth, Some(checkpoint_path), resume_path)?;
-            std::fs::rename(checkpoint_path, SEARCHED_PATH)?;
+            let searched_path = with_timestamp(Path::new("searched.json"));
+            std::fs::rename(checkpoint_path, &searched_path)?;
             info!(
                 "チェックポイントを探索済みファイルへ変更: {}",
-                SEARCHED_PATH
+                searched_path.display()
             );
         }
         SearchMode::Parallel => {

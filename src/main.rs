@@ -12,8 +12,11 @@ use serde::Serialize;
 use simple_logger::SimpleLogger;
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+const CHECKPOINT_PATH: &str = "checkpoint.json";
+const SEARCHED_PATH: &str = "searched.json";
 
 #[derive(Serialize)]
 struct OutputFile<'a> {
@@ -152,8 +155,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     state.target = cli.target;
 
     match cli.mode {
-        SearchMode::Sequential => state.search(cli.depth),
+        SearchMode::Sequential => {
+            let checkpoint_path = Path::new(CHECKPOINT_PATH);
+            let resume_path = checkpoint_path.exists().then_some(checkpoint_path);
+            state.search_with_checkpoint(cli.depth, Some(checkpoint_path), resume_path)?;
+            std::fs::rename(checkpoint_path, SEARCHED_PATH)?;
+            info!(
+                "チェックポイントを探索済みファイルへ変更: {}",
+                SEARCHED_PATH
+            );
+        }
         SearchMode::Parallel => {
+            if Path::new(CHECKPOINT_PATH).exists() {
+                return Err(
+                    "checkpoint.json は sequential モードでのみ再開できます。--mode sequential を指定してください"
+                        .into(),
+                );
+            }
             let result = state.search_parallel(cli.depth);
             state.max_count = result.max_count;
             state.results = result.results;

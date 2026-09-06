@@ -1,5 +1,7 @@
 /// BitVec による高速なビットマスク操作構造体
-#[derive(Clone, Debug)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BitMask {
     data: Vec<u64>,
     size: usize,
@@ -35,6 +37,10 @@ impl BitMask {
     #[inline]
     pub fn count_ones(&self) -> usize {
         self.data.iter().map(|&w| w.count_ones() as usize).sum()
+    }
+
+    pub fn size(&self) -> usize {
+        self.size
     }
 
     /// 指定したインデックスのビットをセット

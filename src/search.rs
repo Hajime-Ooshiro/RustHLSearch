@@ -2,6 +2,9 @@ use crate::bitmask::BitMask;
 use indicatif::{ProgressBar, ProgressStyle};
 use log::info;
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -30,11 +33,26 @@ pub fn build_shift_table(primes: &[usize], cols: usize) -> Vec<Vec<BitMask>> {
     shift_table
 }
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize)]
 struct Frame {
     level: usize,
     base_mask: BitMask,
     next_idx: usize,
+}
+
+#[derive(Deserialize, Serialize)]
+struct Checkpoint {
+    depth: usize,
+    primes: Vec<usize>,
+    limit: usize,
+    cols: usize,
+    stack: Vec<Frame>,
+    key: Vec<usize>,
+    zero_mask: BitMask,
+    max_count: usize,
+    results: usize,
+    shifts: Vec<Vec<usize>>,
+    node_count: u64,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -86,15 +104,51 @@ impl State {
         }
     }
 
-    pub fn search(&mut self, depth: usize) {
+    pub fn search_with_checkpoint(
+        &mut self,
+        depth: usize,
+        checkpoint_path: Option<&Path>,
+        resume_path: Option<&Path>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let pb = progress_bar();
-        let mut stack = vec![Frame {
+        let mut stack = if let Some(path) = resume_path {
+            let checkpoint: Checkpoint = serde_json::from_reader(std::fs::File::open(path)?)?;
+            if checkpoint.depth != depth
+                || checkpoint.primes != self.primes
+                || checkpoint.limit != self.limit
+                || checkpoint.cols != self.zero_mask.size()
+            {
+                return Err(format!(
+                    "チェックポイントの探索設定が現在の設定と一致しません (depth={}, limit={}, cols={})",
+                    checkpoint.depth, checkpoint.limit, checkpoint.cols
+                )
+                .into());
+            }
+            self.key = checkpoint.key;
+            self.zero_mask = checkpoint.zero_mask;
+            self.max_count = checkpoint.max_count;
+            self.results = checkpoint.results;
+            self.shifts = checkpoint.shifts;
+            self.node_count = checkpoint.node_count;
+            info!("チェックポイントから探索を再開しました");
+            checkpoint.stack
+        } else {
+            vec![Frame {
             level: 0,
             base_mask: self.zero_mask.clone(),
             next_idx: self.primes[0],
-        }];
+            }]
+        };
+        let mut checkpoint_due = false;
 
-        while let Some(frame) = stack.last_mut() {
+        while !stack.is_empty() {
+            if checkpoint_due {
+                if let Some(path) = checkpoint_path {
+                    self.write_checkpoint(path, depth, &stack)?;
+                }
+                checkpoint_due = false;
+            }
+            let frame = stack.last_mut().expect("探索スタックが空です");
             if frame.next_idx == 0 {
                 stack.pop();
                 if let Some(parent) = stack.last() {
@@ -122,6 +176,14 @@ impl State {
                     self.results,
                     self.key.len()
                 ));
+                info!(
+                    "探索経過: nodes={} best={} hits={} depth={}",
+                    self.node_count,
+                    self.max_count,
+                    self.results,
+                    self.key.len()
+                );
+                checkpoint_due = true;
             }
 
             if count < self.limit {
@@ -135,23 +197,21 @@ impl State {
             }
 
             if level + 1 >= depth {
-                if depth == self.max_depth {
-                    if count == self.target {
-                        self.results += 1;
-                        self.shifts.push(self.key.clone());
-                        info!("target level={} key={:?} count={}", level, self.key, count);
-                        self.key.pop();
-                        break;
-                    }
-                    if count > self.max_count {
-                        self.max_count = count;
-                        self.shifts.clear();
-                        self.shifts.push(self.key.clone());
-                        info!("best level={} key={:?} count={}", level, self.key, count);
-                    } else if count == self.max_count {
-                        self.shifts.push(self.key.clone());
-                        info!("best level={} key={:?} count={}", level, self.key, count);
-                    }
+                if depth == self.max_depth && count == self.target {
+                    self.results += 1;
+                    self.shifts.push(self.key.clone());
+                    info!("target level={} key={:?} count={}", level, self.key, count);
+                    self.key.pop();
+                    break;
+                }
+                if count > self.max_count {
+                    self.max_count = count;
+                    self.shifts.clear();
+                    self.shifts.push(self.key.clone());
+                    info!("best level={} key={:?} count={}", level, self.key, count);
+                } else if count == self.max_count {
+                    self.shifts.push(self.key.clone());
+                    info!("best level={} key={:?} count={}", level, self.key, count);
                 }
                 self.key.pop();
                 continue;
@@ -165,6 +225,44 @@ impl State {
             });
         }
         pb.finish_with_message("探索完了");
+        if let Some(path) = checkpoint_path {
+            self.write_checkpoint(path, depth, &stack)?;
+        }
+        Ok(())
+    }
+
+    fn write_checkpoint(
+        &self,
+        path: &Path,
+        depth: usize,
+        stack: &[Frame],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        let temporary_path = path.with_extension("tmp");
+        let checkpoint = Checkpoint {
+            depth,
+            primes: self.primes.clone(),
+            limit: self.limit,
+            cols: self.zero_mask.size(),
+            stack: stack.to_vec(),
+            key: self.key.clone(),
+            zero_mask: self.zero_mask.clone(),
+            max_count: self.max_count,
+            results: self.results,
+            shifts: self.shifts.clone(),
+            node_count: self.node_count,
+        };
+        let file = fs::File::create(&temporary_path)?;
+        serde_json::to_writer_pretty(file, &checkpoint)?;
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        fs::rename(temporary_path, path)?;
+        Ok(())
     }
 
     pub fn search_parallel(&self, depth: usize) -> SharedResults {
@@ -233,6 +331,13 @@ impl State {
                         results.load(Ordering::Relaxed),
                         key.len()
                     ));
+                    info!(
+                        "探索経過: nodes={} best={} hits={} depth={}",
+                        n,
+                        max_count.load(Ordering::Relaxed),
+                        results.load(Ordering::Relaxed),
+                        key.len()
+                    );
                 }
 
                 if c_count < self.limit {
@@ -246,28 +351,30 @@ impl State {
                 }
 
                 if level + 1 >= depth {
-                    if c_count == self.limit && !stop.swap(true, Ordering::Relaxed) {
-                        results.fetch_add(1, Ordering::Relaxed);
-                        shifts.lock().unwrap().push(key.clone());
-                        info!("target level={} key={:?} count={}", level, key, c_count);
+                    if depth == self.max_depth {
+                        if c_count == self.target {
+                            results.fetch_add(1, Ordering::Relaxed);
+                            shifts.lock().unwrap().push(key.clone());
+                            info!("target level={} key={:?} count={}", level, key, c_count);
+                        }
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        key.pop();
+                        continue;
                     }
-                    if stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    key.pop();
-                    continue;
-                }
-
-                if depth == self.max_depth {
                     if c_count > max_count.load(Ordering::Relaxed) {
                         max_count.store(c_count, Ordering::Relaxed);
                         shifts.lock().unwrap().clear();
                         shifts.lock().unwrap().push(key.clone());
                         info!("best level={} key={:?} count={}", level, key, c_count);
                     } else if c_count == max_count.load(Ordering::Relaxed) {
+                        results.fetch_add(1, Ordering::Relaxed);
                         shifts.lock().unwrap().push(key.clone());
                         info!("best level={} key={:?} count={}", level, key, c_count);
                     }
+                    key.pop();
+                    continue;
                 }
 
                 stack.push(Frame {
@@ -319,18 +426,20 @@ mod tests {
         let mut sequential = State::new(primes.clone(), 1, cols, table.clone());
         sequential.max_depth = 2;
         sequential.target = 1;
-        sequential.search(2);
+        sequential.search_with_checkpoint(2, None, None).unwrap();
         let mut parallel = State::new(primes.clone(), 1, cols, table);
         parallel.max_depth = 2;
         parallel.target = 1;
         let result = parallel.search_parallel(2);
 
         assert_eq!(sequential.results, 1);
-        assert_eq!(result.results, 1);
-        assert_eq!(result.shifts.len(), 1);
-        assert_eq!(result.shifts[0].len(), 2);
-        for (level, &shift) in result.shifts[0].iter().enumerate() {
-            assert!(shift < primes[level]);
+        assert!(result.results > 0);
+        assert_eq!(result.shifts.len(), result.results);
+        for shifts in &result.shifts {
+            assert_eq!(shifts.len(), 2);
+            for (level, &shift) in shifts.iter().enumerate() {
+                assert!(shift < primes[level]);
+            }
         }
     }
 }

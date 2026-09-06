@@ -337,11 +337,26 @@ impl State {
             }
 
             if depth == 1 {
-                max_count.fetch_max(count, Ordering::Relaxed);
-                if count == self.limit && !stop.swap(true, Ordering::Relaxed) {
-                    results.fetch_add(1, Ordering::Relaxed);
-                    shifts.lock().unwrap().push(key.clone());
-                    info!("target level=0 key={:?} count={}", key, count);
+                if depth == self.max_depth {
+                    if count == self.target && !stop.swap(true, Ordering::Relaxed) {
+                        results.fetch_add(1, Ordering::Relaxed);
+                        shifts.lock().unwrap().push(key.clone());
+                        info!("target level=0 key={:?} count={}", key, count);
+                    }
+                } else {
+                    let mut recorded_shifts = shifts.lock().unwrap();
+                    let current_max = max_count.load(Ordering::Relaxed);
+                    if count > current_max {
+                        max_count.store(count, Ordering::Relaxed);
+                        results.store(1, Ordering::Relaxed);
+                        recorded_shifts.clear();
+                        recorded_shifts.push(key.clone());
+                        info!("best level=0 key={:?} count={}", key, count);
+                    } else if count == current_max {
+                        results.fetch_add(1, Ordering::Relaxed);
+                        recorded_shifts.push(key.clone());
+                        info!("best level=0 key={:?} count={}", key, count);
+                    }
                 }
                 return;
             }
@@ -492,6 +507,26 @@ mod tests {
                 assert!(shift < primes[level]);
             }
         }
+    }
+
+    #[test]
+    fn sequential_and_parallel_search_record_all_best_leaves() {
+        let primes = vec![2];
+        let cols = 4;
+        let table = build_shift_table(&primes, cols);
+
+        let mut sequential = State::new(primes.clone(), 1, cols, table.clone());
+        sequential.search_with_checkpoint(1, None, None).unwrap();
+
+        let parallel = State::new(primes, 1, cols, table);
+        let result = parallel.search_parallel(1);
+
+        assert_eq!(sequential.max_count, 2);
+        assert_eq!(sequential.results, 2);
+        assert_eq!(sequential.shifts, vec![vec![1], vec![0]]);
+        assert_eq!(result.max_count, 2);
+        assert_eq!(result.results, 2);
+        assert_eq!(result.shifts.len(), 2);
     }
 
     #[test]

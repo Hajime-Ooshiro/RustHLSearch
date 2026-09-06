@@ -36,4 +36,12 @@ mod tests {
         assert_eq!(generate_primes(2), vec![2]);
         assert_eq!(generate_primes(10), vec![2, 3, 5, 7]);
     }
+
+    #[test]
+    fn generates_primes_through_inclusive_limit() {
+        assert_eq!(
+            generate_primes(30),
+            vec![2, 3, 5, 7, 11, 13, 17, 19, 23, 29]
+        );
+    }
 }

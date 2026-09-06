@@ -36,4 +36,12 @@ mod tests {
         assert!(file_name.starts_with("shift_path_"));
         assert!(file_name.ends_with(".json"));
     }
+
+    #[test]
+    fn timestamped_path_handles_extensionless_file() {
+        let path = with_timestamp(Path::new("shift_path"));
+        let file_name = path.file_name().unwrap().to_str().unwrap();
+        assert!(file_name.starts_with("shift_path_"));
+        assert!(path.extension().is_none());
+    }
 }

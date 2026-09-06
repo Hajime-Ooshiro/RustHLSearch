@@ -76,4 +76,26 @@ mod tests {
         mask.set(0, false);
         assert_eq!(mask.count_ones(), 1);
     }
+
+    #[test]
+    fn initializes_only_logical_bits_at_word_boundaries() {
+        assert_eq!(BitMask::new_ones(0).count_ones(), 0);
+        assert_eq!(BitMask::new_ones(64).count_ones(), 64);
+        assert_eq!(BitMask::new_ones(65).count_ones(), 65);
+    }
+
+    #[test]
+    fn bitand_retains_only_shared_set_bits() {
+        let mut left = BitMask::new_ones(65);
+        let mut right = BitMask::new_ones(65);
+        left.set(1, false);
+        left.set(64, false);
+        right.set(0, false);
+        right.set(64, false);
+
+        let result = left.bitand(&right);
+
+        assert_eq!(result.size(), 65);
+        assert_eq!(result.count_ones(), 62);
+    }
 }

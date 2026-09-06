@@ -216,10 +216,12 @@ impl State {
                 }
                 if count > self.max_count {
                     self.max_count = count;
+                    self.results = 1;
                     self.shifts.clear();
                     self.shifts.push(self.key.clone());
                     info!("best level={} key={:?} count={}", level, self.key, count);
                 } else if count == self.max_count {
+                    self.results += 1;
                     self.shifts.push(self.key.clone());
                     info!("best level={} key={:?} count={}", level, self.key, count);
                 }
@@ -413,6 +415,7 @@ impl State {
                     }
                     if c_count > max_count.load(Ordering::Relaxed) {
                         max_count.store(c_count, Ordering::Relaxed);
+                        results.store(1, Ordering::Relaxed);
                         shifts.lock().unwrap().clear();
                         shifts.lock().unwrap().push(key.clone());
                         info!("best level={} key={:?} count={}", level, key, c_count);
@@ -489,5 +492,104 @@ mod tests {
                 assert!(shift < primes[level]);
             }
         }
+    }
+
+    #[test]
+    fn checkpoint_interval_defaults_to_100k() {
+        let table = build_shift_table(&[2], 4);
+        let state = State::new(vec![2], 1, 4, table);
+        assert_eq!(state.checkpoint_interval, 100_000);
+    }
+
+    #[test]
+    fn checkpoint_interval_can_be_set() {
+        let table = build_shift_table(&[2], 4);
+        let mut state = State::new(vec![2], 1, 4, table);
+        state.checkpoint_interval = 5_000;
+        assert_eq!(state.checkpoint_interval, 5_000);
+    }
+
+    #[test]
+    fn rebuild_stack_and_masks_recovers_search_position() {
+        let primes = vec![2, 3];
+        let cols = 4;
+        let table = build_shift_table(&primes, cols);
+        let mut state = State::new(primes.clone(), 1, cols, table);
+
+        state.key = vec![1, 0];
+        state.node_count = 10;
+        state.max_count = 2;
+        state.results = 0;
+
+        let saved_stack = vec![super::StackFrame {
+            level: 1,
+            next_idx: 2,
+        }];
+
+        let rebuilt_stack = state.rebuild_stack_and_masks(&saved_stack).unwrap();
+
+        assert_eq!(rebuilt_stack.len(), 1);
+        assert_eq!(rebuilt_stack[0].level, 1);
+        assert_eq!(rebuilt_stack[0].next_idx, 2);
+        assert!(rebuilt_stack[0].base_mask.count_ones() > 0);
+    }
+
+    #[test]
+    fn stack_frame_serialization_is_lightweight() {
+        use serde_json;
+        let frame = super::StackFrame {
+            level: 5,
+            next_idx: 42,
+        };
+        let json = serde_json::to_string(&frame).unwrap();
+        assert!(json.contains("\"level\":5"));
+        assert!(json.contains("\"next_idx\":42"));
+        assert!(!json.contains("base_mask"));
+    }
+
+    #[test]
+    fn checkpoint_stores_only_key_level_and_next_idx() {
+        use serde_json;
+        let checkpoint = super::Checkpoint {
+            depth: 2,
+            primes: vec![2, 3],
+            limit: 1,
+            cols: 4,
+            stack: vec![super::StackFrame {
+                level: 0,
+                next_idx: 1,
+            }],
+            key: vec![1],
+            max_count: 2,
+            results: 0,
+            shifts: vec![],
+            node_count: 100,
+        };
+        let json = serde_json::to_string_pretty(&checkpoint).unwrap();
+        assert!(json.contains("depth"));
+        assert!(json.contains("key"));
+        assert!(json.contains("level"));
+        assert!(json.contains("next_idx"));
+        assert!(!json.contains("zero_mask"));
+        assert!(!json.contains("base_mask"));
+    }
+
+    #[test]
+    fn multiple_keys_rebuild_to_correct_masks() {
+        let primes = vec![2, 3, 5];
+        let cols = 8;
+        let table = build_shift_table(&primes, cols);
+        let mut state = State::new(primes.clone(), 1, cols, table);
+
+        state.key = vec![1, 2, 1];
+
+        let saved_stack = vec![super::StackFrame {
+            level: 2,
+            next_idx: 3,
+        }];
+
+        let rebuilt = state.rebuild_stack_and_masks(&saved_stack).unwrap();
+        assert_eq!(rebuilt.len(), 1);
+        assert_eq!(rebuilt[0].level, 2);
     }
 }

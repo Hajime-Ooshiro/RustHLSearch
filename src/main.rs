@@ -269,4 +269,40 @@ mod tests {
         cli.primes_count = Some(4);
         assert!(cli.validate(3).is_err());
     }
+
+    #[test]
+    fn cli_validation_accepts_depth_equal_to_selected_prime_count() {
+        let mut cli = test_cli();
+        cli.depth = 3;
+        cli.primes_count = Some(3);
+        assert!(cli.validate(3).is_ok());
+    }
+
+    #[test]
+    fn cli_validation_rejects_zero_or_insufficient_selected_prime_count() {
+        let mut cli = test_cli();
+        cli.primes_count = Some(0);
+        assert_eq!(
+            cli.validate(3).unwrap_err(),
+            "primes-count must be at least 1"
+        );
+
+        cli = test_cli();
+        cli.depth = 2;
+        cli.primes_count = Some(1);
+        assert_eq!(
+            cli.validate(3).unwrap_err(),
+            "depth (2) cannot exceed primes-count (1)"
+        );
+    }
+
+    #[test]
+    fn cli_validation_rejects_depth_above_available_primes_without_limit() {
+        let mut cli = test_cli();
+        cli.depth = 4;
+        assert_eq!(
+            cli.validate(3).unwrap_err(),
+            "depth (4) cannot exceed available primes (3)"
+        );
+    }
 }

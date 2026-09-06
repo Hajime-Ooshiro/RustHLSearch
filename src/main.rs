@@ -30,6 +30,7 @@ struct OutputConfig<'a> {
     limit: usize,
     max_depth: usize,
     target: usize,
+    all: bool,
     cols: usize,
     primes_count: &'a str,
     elapsed: String,
@@ -65,6 +66,9 @@ pub struct Cli {
 
     #[arg(short, long, default_value_t = 447, help = "打ち切り目標値")]
     pub target: usize,
+
+    #[arg(long, help = "ターゲット一致の全件を検索する")]
+    pub all: bool,
 
     #[arg(long, default_value_t = 3159, help = "列数 (長さ)")]
     pub cols: usize,
@@ -145,12 +149,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("HLSearch (Rust) 開始");
     info!(
-        "設定: mode={:?} depth={} limit={} max_depth={} target={} primes_count={}",
+        "設定: mode={:?} depth={} limit={} max_depth={} target={} all={} primes_count={}",
         cli.mode,
         cli.depth,
         cli.limit,
         cli.max_depth,
         cli.target,
+        cli.all,
         primes.len()
     );
 
@@ -159,6 +164,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut state = State::new(primes, cli.limit, cli.cols, shift_table);
     state.max_depth = cli.max_depth;
     state.target = cli.target;
+    state.all = cli.all;
     state.checkpoint_interval = cli.checkpoint_interval;
 
     match cli.mode {
@@ -214,6 +220,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             limit: cli.limit,
             max_depth: cli.max_depth,
             target: cli.target,
+            all: cli.all,
             cols: cli.cols,
             primes_count: &primes_count,
             elapsed: format!("{elapsed:?}"),
@@ -242,6 +249,7 @@ mod tests {
             limit: 1,
             max_depth: 249,
             target: 447,
+            all: false,
             cols: 4,
             primes_count: None,
             output: PathBuf::from("shift_path.txt"),
@@ -304,5 +312,11 @@ mod tests {
             cli.validate(3).unwrap_err(),
             "depth (4) cannot exceed available primes (3)"
         );
+    }
+
+    #[test]
+    fn cli_all_flag_defaults_to_false_and_can_be_enabled() {
+        assert!(!Cli::try_parse_from(["hlsearch"]).unwrap().all);
+        assert!(Cli::try_parse_from(["hlsearch", "--all"]).unwrap().all);
     }
 }

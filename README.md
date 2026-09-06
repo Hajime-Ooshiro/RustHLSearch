@@ -131,7 +131,7 @@ cargo run --release -- --depth 10 --limit 400 --primes-count 100 -o result.json
 - `--mode parallel`（デフォルト）: 第1素数のシフト候補を逆順（降順）で Rayon の並列イテレータに分配し、複数スレッドで並列 DFS します。いずれかのスレッドが解を見つけた時点で全スレッドを停止します。
 - `--mode sequential`: 単一スレッドで決定論的に非再帰 DFS を実行します。
 
-並列モードではスレッドの実行順序により、記録される解のシフト列が逐次モードと異なる場合があります。どちらのモードも、最初に見つかった `limit` 一致の解を1件記録して探索を終了します。
+並列モードではスレッドの実行順序により、記録される解のシフト列が逐次モードと異なる場合があります。ターゲット一致時は既定で最初の1件を記録して終了し、`--all` を指定すると一致した全件を記録します。
 
 ## コマンドラインオプション
 
@@ -146,6 +146,7 @@ cargo run --release -- --depth 10 --limit 400 --primes-count 100 -o result.json
 | `--checkpoint-interval` | | `100000` | チェックポイント保存周期 (ノード数) |
 | `--max-depth` | | `249` | 出力設定に記録される予約パラメータ |
 | `--target` | `-t` | `447` | 出力設定に記録される予約パラメータ |
+| `--all` | | 指定なし | ターゲット一致の全件を検索する（既定は最初の1件） |
 
 > **Note**: `--max-depth` と `--target` は現在の探索条件には影響せず、実行設定として出力ファイルに記録されます。
 
@@ -163,6 +164,7 @@ cargo run --release -- --depth 10 --limit 400 --primes-count 100 -o result.json
     "limit": 447,
     "max_depth": 249,
     "target": 447,
+    "all": false,
     "cols": 3159,
     "primes_count": "all",
     "elapsed": "1.234567s"

@@ -51,6 +51,7 @@ struct Checkpoint {
     depth: usize,
     primes: Vec<usize>,
     limit: usize,
+    all: bool,
     cols: usize,
     stack: Vec<StackFrame>,
     key: Vec<usize>,
@@ -78,6 +79,7 @@ pub struct State {
     pub limit: usize,
     pub max_depth: usize,
     pub target: usize,
+    pub all: bool,
     pub key: Vec<usize>,
     pub zero_mask: BitMask,
     pub max_count: usize,
@@ -100,6 +102,7 @@ impl State {
             limit,
             max_depth: 249,
             target: 447,
+            all: false,
             key: Vec::new(),
             zero_mask: BitMask::new_ones(cols),
             max_count: 0,
@@ -123,11 +126,12 @@ impl State {
             if checkpoint.depth != depth
                 || checkpoint.primes != self.primes
                 || checkpoint.limit != self.limit
+                || checkpoint.all != self.all
                 || checkpoint.cols != self.zero_mask.size()
             {
                 return Err(format!(
-                    "チェックポイントの探索設定が現在の設定と一致しません (depth={}, limit={}, cols={})",
-                    checkpoint.depth, checkpoint.limit, checkpoint.cols
+                    "チェックポイントの探索設定が現在の設定と一致しません (depth={}, limit={}, all={}, cols={})",
+                    checkpoint.depth, checkpoint.limit, checkpoint.all, checkpoint.cols
                 )
                 .into());
             }
@@ -212,7 +216,10 @@ impl State {
                     self.shifts.push(self.key.clone());
                     info!("target level={} key={:?} count={}", level, self.key, count);
                     self.key.pop();
-                    break;
+                    if !self.all {
+                        break;
+                    }
+                    continue;
                 }
                 if count > self.max_count {
                     self.max_count = count;
@@ -266,6 +273,7 @@ impl State {
             depth,
             primes: self.primes.clone(),
             limit: self.limit,
+            all: self.all,
             cols: self.zero_mask.size(),
             stack: stack_frames,
             key: self.key.clone(),
@@ -338,7 +346,7 @@ impl State {
 
             if depth == 1 {
                 if depth == self.max_depth {
-                    if count == self.target && !stop.swap(true, Ordering::Relaxed) {
+                    if count == self.target && (self.all || !stop.swap(true, Ordering::Relaxed)) {
                         results.fetch_add(1, Ordering::Relaxed);
                         shifts.lock().unwrap().push(key.clone());
                         info!("target level=0 key={:?} count={}", key, count);
@@ -417,13 +425,12 @@ impl State {
 
                 if level + 1 >= depth {
                     if depth == self.max_depth {
-                        if c_count == self.target {
+                        if c_count == self.target
+                            && (self.all || !stop.swap(true, Ordering::Relaxed))
+                        {
                             results.fetch_add(1, Ordering::Relaxed);
                             shifts.lock().unwrap().push(key.clone());
                             info!("target level={} key={:?} count={}", level, key, c_count);
-                        }
-                        if stop.load(Ordering::Relaxed) {
-                            break;
                         }
                         key.pop();
                         continue;
@@ -530,6 +537,41 @@ mod tests {
     }
 
     #[test]
+    fn all_flag_controls_target_match_count_in_both_search_modes() {
+        let primes = vec![2];
+        let cols = 4;
+        let table = build_shift_table(&primes, cols);
+
+        let mut sequential_one = State::new(primes.clone(), 1, cols, table.clone());
+        sequential_one.max_depth = 1;
+        sequential_one.target = 2;
+        sequential_one
+            .search_with_checkpoint(1, None, None)
+            .unwrap();
+        assert_eq!(sequential_one.results, 1);
+
+        let mut sequential_all = State::new(primes.clone(), 1, cols, table.clone());
+        sequential_all.max_depth = 1;
+        sequential_all.target = 2;
+        sequential_all.all = true;
+        sequential_all
+            .search_with_checkpoint(1, None, None)
+            .unwrap();
+        assert_eq!(sequential_all.results, 2);
+
+        let mut parallel_one = State::new(primes.clone(), 1, cols, table.clone());
+        parallel_one.max_depth = 1;
+        parallel_one.target = 2;
+        assert_eq!(parallel_one.search_parallel(1).results, 1);
+
+        let mut parallel_all = State::new(primes, 1, cols, table);
+        parallel_all.max_depth = 1;
+        parallel_all.target = 2;
+        parallel_all.all = true;
+        assert_eq!(parallel_all.search_parallel(1).results, 2);
+    }
+
+    #[test]
     fn checkpoint_interval_defaults_to_100k() {
         let table = build_shift_table(&[2], 4);
         let state = State::new(vec![2], 1, 4, table);
@@ -589,6 +631,7 @@ mod tests {
             depth: 2,
             primes: vec![2, 3],
             limit: 1,
+            all: false,
             cols: 4,
             stack: vec![super::StackFrame {
                 level: 0,

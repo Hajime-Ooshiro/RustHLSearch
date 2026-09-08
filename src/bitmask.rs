@@ -18,19 +18,18 @@ impl BitMask {
         BitMask { data, size }
     }
 
-    /// bitwise AND
+    /// `lhs & rhs` を既存の領域へ格納し、1 ビット数を返す
     #[inline]
-    pub fn bitand(&self, rhs: &Self) -> Self {
-        let data = self
-            .data
-            .iter()
-            .zip(rhs.data.iter())
-            .map(|(&a, &b)| a & b)
-            .collect();
-        BitMask {
-            data,
-            size: self.size,
-        }
+    pub fn bitand_into_count(&mut self, lhs: &Self, rhs: &Self) -> usize {
+        self.data
+            .iter_mut()
+            .zip(lhs.data.iter().zip(rhs.data.iter()))
+            .map(|(out, (&left, &right))| {
+                let value = left & right;
+                *out = value;
+                value.count_ones() as usize
+            })
+            .sum()
     }
 
     /// 1 (true) のビット数をカウント (popcount)
@@ -85,7 +84,7 @@ mod tests {
     }
 
     #[test]
-    fn bitand_retains_only_shared_set_bits() {
+    fn bitand_into_count_retains_only_shared_set_bits() {
         let mut left = BitMask::new_ones(65);
         let mut right = BitMask::new_ones(65);
         left.set(1, false);
@@ -93,9 +92,23 @@ mod tests {
         right.set(0, false);
         right.set(64, false);
 
-        let result = left.bitand(&right);
+        let mut result = BitMask::new_ones(65);
+        result.bitand_into_count(&left, &right);
 
         assert_eq!(result.size(), 65);
         assert_eq!(result.count_ones(), 62);
+    }
+
+    #[test]
+    fn bitand_into_count_reuses_destination_and_counts_bits() {
+        let mut left = BitMask::new_ones(65);
+        let mut right = BitMask::new_ones(65);
+        left.set(1, false);
+        right.set(0, false);
+        let mut output = BitMask::new_ones(65);
+
+        assert_eq!(output.bitand_into_count(&left, &right), 63);
+        assert_eq!(output.count_ones(), 63);
+        assert_eq!(output.size(), 65);
     }
 }

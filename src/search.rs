@@ -232,13 +232,6 @@ impl State {
                     self.results,
                     self.key.len()
                 ));
-                // info!(
-                //     "探索経過: nodes={} best={} hits={} depth={}",
-                //     self.node_count,
-                //     self.max_count,
-                //     self.results,
-                //     self.key.len()
-                // );
                 checkpoint_due = true;
             }
 

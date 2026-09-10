@@ -99,7 +99,7 @@ cargo run --release -- --mode sequential --checkpoint-interval 50000
 素数の個数や出力先を指定して実行:
 
 ```bash
-cargo run --release -- --depth 10 --max-depth 10 --target 400 --primes-count 100 -o result.json
+cargo run --release -- --depth 10 --max-depth 10 --target 400 -o result.json
 ```
 
 > **Note**: 並列モード時のスレッド数は Rayon の既定値（論理コア数）となります。環境変数 `RAYON_NUM_THREADS` でスレッド数を指定可能です。
@@ -111,13 +111,12 @@ cargo run --release -- --depth 10 --max-depth 10 --target 400 --primes-count 100
 - `depth` は 1 以上
 - `cols` は 1 以上
 - `target` は `cols` 以下
-- `primes-count` は 1 以上かつ利用可能な素数数以下
 - `depth` は使用する素数数以下
 
 ## 探索アルゴリズムの概要
 
 1. **素数生成**:
-   - 1579 以下の素数（最大 249 個）をエラトステネスの篩で生成し、先頭から `depth` 個を探索階層に使用します（`--primes-count` で上限指定可能）。
+   - 1579 以下の素数（最大 249 個）をエラトステネスの篩で生成し、先頭から `depth` 個を探索階層に使用します。
 2. **補集合シフトテーブル作成**:
    - 各素数 $p$ とシフト $k \in [0, p)$ について、長さ `cols` の補集合ビットマスクを事前構築します。
 3. **深さ優先探索 (DFS)**:
@@ -142,7 +141,6 @@ cargo run --release -- --depth 10 --max-depth 10 --target 400 --primes-count 100
 | `--depth` | `-d` | `8` | 探索する階層数（使用する素数の個数） |
 | `--mode` | `-m` | `parallel` | 探索モード（`parallel` または `sequential`） |
 | `--cols` | | `3159` | ビット列の長さ |
-| `--primes-count` | | 全素数 (249) | 使用する素数の最大個数制限 |
 | `--output` | `-o` | `shift_path.json` | JSON出力ファイルパス（実行時にタイムスタンプが挿入されます） |
 | `--checkpoint-interval` | | `100000` | チェックポイント保存周期 (ノード数) |
 | `--max-depth` | | `249` | target 判定を行う探索深さ |
@@ -162,7 +160,6 @@ cargo run --release -- --depth 10 --max-depth 10 --target 400 --primes-count 100
     "max_depth": 249,
     "target": 447,
     "cols": 3159,
-    "primes_count": "all",
     "elapsed": "1.234567s"
   },
   "result": {

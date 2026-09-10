@@ -30,7 +30,6 @@ struct OutputConfig<'a> {
     max_depth: usize,
     target: usize,
     cols: usize,
-    primes_count: &'a str,
     elapsed: String,
 }
 
@@ -67,9 +66,6 @@ pub struct Cli {
     #[arg(long, default_value_t = 3159, help = "列数 (長さ)")]
     pub cols: usize,
 
-    #[arg(long, help = "使用する素数の個数制限")]
-    pub primes_count: Option<usize>,
-
     #[arg(
         short,
         long,
@@ -103,23 +99,7 @@ impl Cli {
         if self.checkpoint_interval == 0 {
             return Err("checkpoint-interval must be at least 1".to_string());
         }
-        if let Some(primes_count) = self.primes_count {
-            if primes_count == 0 {
-                return Err("primes-count must be at least 1".to_string());
-            }
-            if primes_count > available_primes {
-                return Err(format!(
-                    "primes-count ({}) cannot exceed available primes ({})",
-                    primes_count, available_primes
-                ));
-            }
-            if self.depth > primes_count {
-                return Err(format!(
-                    "depth ({}) cannot exceed primes-count ({})",
-                    self.depth, primes_count
-                ));
-            }
-        } else if self.depth > available_primes {
+        if self.depth > available_primes {
             return Err(format!(
                 "depth ({}) cannot exceed available primes ({})",
                 self.depth, available_primes
@@ -139,24 +119,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    let primes = match cli.primes_count {
-        Some(cnt) => all_primes[..cnt].to_vec(),
-        None => all_primes,
-    };
-
     info!("HLSearch (Rust) 開始");
     info!(
-        "設定: mode={:?} depth={} max_depth={} target={} primes_count={}",
-        cli.mode,
-        cli.depth,
-        cli.max_depth,
-        cli.target,
-        primes.len()
+        "設定: mode={:?} depth={} max_depth={} target={}",
+        cli.mode, cli.depth, cli.max_depth, cli.target
     );
 
     let start_time = Instant::now();
-    let shift_table = build_shift_table(&primes[..cli.depth], cli.cols);
-    let mut state = State::new(primes, cli.cols, shift_table);
+    let shift_table = build_shift_table(&all_primes[..cli.depth], cli.cols);
+    let mut state = State::new(all_primes, cli.cols, shift_table);
     state.max_depth = cli.max_depth;
     state.target = cli.target;
     state.checkpoint_interval = cli.checkpoint_interval;
@@ -200,10 +171,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut writer = BufWriter::new(file);
     info!("出力ファイル: {}", output_path.display());
 
-    let primes_count = cli
-        .primes_count
-        .map(|count| count.to_string())
-        .unwrap_or_else(|| "all".to_string());
     let output = OutputFile {
         config: OutputConfig {
             mode: match cli.mode {
@@ -214,7 +181,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_depth: cli.max_depth,
             target: cli.target,
             cols: cli.cols,
-            primes_count: &primes_count,
             elapsed: format!("{elapsed:?}"),
         },
         result: OutputResult {
@@ -243,7 +209,6 @@ mod tests {
             max_depth: 249,
             target: 1,
             cols: 4,
-            primes_count: None,
             output: PathBuf::from("shift_path.txt"),
             checkpoint_interval: 100_000,
         }
@@ -273,35 +238,6 @@ mod tests {
         assert_eq!(
             cli.validate(3).unwrap_err(),
             "checkpoint-interval must be at least 1"
-        );
-        cli = test_cli();
-        cli.primes_count = Some(4);
-        assert!(cli.validate(3).is_err());
-    }
-
-    #[test]
-    fn cli_validation_accepts_depth_equal_to_selected_prime_count() {
-        let mut cli = test_cli();
-        cli.depth = 3;
-        cli.primes_count = Some(3);
-        assert!(cli.validate(3).is_ok());
-    }
-
-    #[test]
-    fn cli_validation_rejects_zero_or_insufficient_selected_prime_count() {
-        let mut cli = test_cli();
-        cli.primes_count = Some(0);
-        assert_eq!(
-            cli.validate(3).unwrap_err(),
-            "primes-count must be at least 1"
-        );
-
-        cli = test_cli();
-        cli.depth = 2;
-        cli.primes_count = Some(1);
-        assert_eq!(
-            cli.validate(3).unwrap_err(),
-            "depth (2) cannot exceed primes-count (1)"
         );
     }
 

@@ -30,6 +30,7 @@ struct OutputConfig<'a> {
     max_depth: usize,
     target: usize,
     cols: usize,
+    parallel_tasks_per_thread: usize,
     elapsed: String,
 }
 
@@ -80,6 +81,9 @@ pub struct Cli {
         help = "チェックポイント保存周期 (ノード数)"
     )]
     pub checkpoint_interval: u64,
+
+    #[arg(long, default_value_t = 4, help = "並列時のスレッド当たりタスク数")]
+    pub parallel_tasks_per_thread: usize,
 }
 
 impl Cli {
@@ -98,6 +102,9 @@ impl Cli {
         }
         if self.checkpoint_interval == 0 {
             return Err("checkpoint-interval must be at least 1".to_string());
+        }
+        if self.parallel_tasks_per_thread == 0 {
+            return Err("parallel-tasks-per-thread must be at least 1".to_string());
         }
         if self.depth > available_primes {
             return Err(format!(
@@ -131,6 +138,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     state.max_depth = cli.max_depth;
     state.target = cli.target;
     state.checkpoint_interval = cli.checkpoint_interval;
+    state.parallel_tasks_per_thread = cli.parallel_tasks_per_thread;
 
     match cli.mode {
         SearchMode::Sequential => {
@@ -155,6 +163,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             state.max_count = result.max_count;
             state.results = result.results;
             state.shifts = result.shifts;
+            state.target_results = result.target_results;
+            state.target_shifts = result.target_shifts;
         }
     }
 
@@ -181,6 +191,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_depth: cli.max_depth,
             target: cli.target,
             cols: cli.cols,
+            parallel_tasks_per_thread: cli.parallel_tasks_per_thread,
             elapsed: format!("{elapsed:?}"),
         },
         result: OutputResult {
@@ -211,6 +222,7 @@ mod tests {
             cols: 4,
             output: PathBuf::from("shift_path.txt"),
             checkpoint_interval: 100_000,
+            parallel_tasks_per_thread: 4,
         }
     }
 
@@ -238,6 +250,12 @@ mod tests {
         assert_eq!(
             cli.validate(3).unwrap_err(),
             "checkpoint-interval must be at least 1"
+        );
+        cli = test_cli();
+        cli.parallel_tasks_per_thread = 0;
+        assert_eq!(
+            cli.validate(3).unwrap_err(),
+            "parallel-tasks-per-thread must be at least 1"
         );
     }
 

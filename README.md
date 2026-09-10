@@ -103,6 +103,7 @@ cargo run --release -- --depth 10 --max-depth 10 --target 400 -o result.json
 ```
 
 > **Note**: 並列モード時のスレッド数は Rayon の既定値（論理コア数）となります。環境変数 `RAYON_NUM_THREADS` でスレッド数を指定可能です。
+> タスク数は既定でスレッド数の4倍です。枝ごとの探索量に偏りがある場合は、`--parallel-tasks-per-thread` を増やして負荷分散を調整できます。
 
 ### 入力値の検証
 
@@ -143,6 +144,7 @@ cargo run --release -- --depth 10 --max-depth 10 --target 400 -o result.json
 | `--cols` | | `3159` | ビット列の長さ |
 | `--output` | `-o` | `shift_path.json` | JSON出力ファイルパス（実行時にタイムスタンプが挿入されます） |
 | `--checkpoint-interval` | | `100000` | チェックポイント保存周期 (ノード数) |
+| `--parallel-tasks-per-thread` | | `4` | 並列時のスレッド当たりタスク数 |
 | `--max-depth` | | `249` | target 判定を行う探索深さ |
 | `--target` | `-t` | `447` | `max-depth` 時に記録対象とする popcount |
 

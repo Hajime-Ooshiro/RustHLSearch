@@ -77,40 +77,60 @@ struct ParallelResults {
 }
 
 impl ParallelResults {
-    fn record_best(&self, count: usize, key: &[usize]) {
+    fn observe_best(&self, count: usize) -> bool {
         loop {
             let current = self.max_count.load(Ordering::Relaxed);
             if count < current {
-                return;
+                return false;
             }
             if count == current {
-                let mut results = self.results.lock().unwrap();
-                if self.max_count.load(Ordering::Relaxed) == count {
-                    results.results += 1;
-                    results.shifts.push(key.to_vec());
-                }
-                return;
+                return true;
             }
             if self
                 .max_count
                 .compare_exchange_weak(current, count, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
             {
-                let mut results = self.results.lock().unwrap();
-                if self.max_count.load(Ordering::Relaxed) == count {
-                    results.results = 1;
-                    results.shifts.clear();
-                    results.shifts.push(key.to_vec());
-                }
-                return;
+                return true;
             }
         }
+    }
+
+    fn merge(&self, local: SharedResults) {
+        let max_count = self.max_count.load(Ordering::Relaxed);
+        let mut results = self.results.lock().unwrap();
+
+        if results.max_count < max_count {
+            results.max_count = max_count;
+            results.results = 0;
+            results.shifts.clear();
+        }
+        if local.max_count == max_count {
+            results.results += local.results;
+            results.shifts.extend(local.shifts);
+        }
+        results.target_results += local.target_results;
+        results.target_shifts.extend(local.target_shifts);
     }
 
     fn snapshot(&self) -> SharedResults {
         let mut results = self.results.lock().unwrap().clone();
         results.max_count = self.max_count.load(Ordering::Relaxed);
         results
+    }
+}
+
+impl SharedResults {
+    fn record_best(&mut self, count: usize, key: &[usize]) {
+        if count > self.max_count {
+            self.max_count = count;
+            self.results = 1;
+            self.shifts.clear();
+            self.shifts.push(key.to_vec());
+        } else if count == self.max_count {
+            self.results += 1;
+            self.shifts.push(key.to_vec());
+        }
     }
 }
 
@@ -133,6 +153,7 @@ pub struct State {
     pub target_shifts: Vec<Vec<usize>>,
     pub node_count: u64,
     pub checkpoint_interval: u64,
+    pub parallel_tasks_per_thread: usize,
     shift_table: Vec<Vec<BitMask>>,
 }
 
@@ -151,6 +172,7 @@ impl State {
             target_shifts: Vec::new(),
             node_count: 0,
             checkpoint_interval: 100_000,
+            parallel_tasks_per_thread: 4,
             shift_table,
         }
     }
@@ -235,7 +257,7 @@ impl State {
                 checkpoint_due = true;
             }
 
-            if count < self.max_count && count < self.target {
+            if should_prune(count, self.max_count, self.target, depth == self.max_depth) {
                 self.key.pop();
                 continue;
             }
@@ -350,23 +372,37 @@ impl State {
         let node_count = Arc::new(AtomicU64::new(0));
         let pb = progress_bar();
 
-        let split_depth = self.parallel_split_depth(depth);
+        let target_tasks =
+            rayon::current_num_threads().saturating_mul(self.parallel_tasks_per_thread);
+        let split_depth = self.parallel_split_depth(depth, target_tasks);
         let work_items = self.parallel_work_items(split_depth);
         work_items.into_par_iter().for_each(|work_item| {
             let mut key = work_item.key;
             let mut masks = vec![self.zero_mask.clone(); depth + 1];
             masks[split_depth] = work_item.base_mask;
             let count = masks[split_depth].count_ones();
+            let mut local = SharedResults::default();
             if split_depth == depth {
-                results.record_best(count, &key);
-                if depth == self.max_depth && count == self.target {
-                    let mut shared = results.results.lock().unwrap();
-                    shared.target_results += 1;
-                    shared.target_shifts.push(key);
+                if results.observe_best(count) {
+                    local.record_best(count, &key);
                 }
+                if depth == self.max_depth && count == self.target {
+                    local.target_results = 1;
+                    local.target_shifts.push(key);
+                }
+                results.merge(local);
                 return;
             }
 
+            if should_prune(
+                count,
+                results.max_count.load(Ordering::Relaxed),
+                self.target,
+                depth == self.max_depth,
+            ) {
+                results.merge(local);
+                return;
+            }
             let mut stack = vec![Frame {
                 level: split_depth,
                 next_idx: self.primes[split_depth],
@@ -404,17 +440,23 @@ impl State {
                     ));
                 }
 
-                if c_count < results.max_count.load(Ordering::Relaxed) && c_count < self.target {
+                if should_prune(
+                    c_count,
+                    results.max_count.load(Ordering::Relaxed),
+                    self.target,
+                    depth == self.max_depth,
+                ) {
                     key.pop();
                     continue;
                 }
 
                 if level + 1 >= depth {
-                    results.record_best(c_count, &key);
+                    if results.observe_best(c_count) {
+                        local.record_best(c_count, &key);
+                    }
                     if depth == self.max_depth && c_count == self.target {
-                        let mut shared = results.results.lock().unwrap();
-                        shared.target_results += 1;
-                        shared.target_shifts.push(key.clone());
+                        local.target_results += 1;
+                        local.target_shifts.push(key.clone());
                     }
                     key.pop();
                     continue;
@@ -426,14 +468,14 @@ impl State {
                 });
             }
             node_count.fetch_add(local_nodes, Ordering::Relaxed);
+            results.merge(local);
         });
 
         pb.finish_with_message("探索完了");
         results.snapshot()
     }
 
-    fn parallel_split_depth(&self, depth: usize) -> usize {
-        let target_tasks = rayon::current_num_threads() * 4;
+    fn parallel_split_depth(&self, depth: usize, target_tasks: usize) -> usize {
         let mut task_count: usize = 1;
         for level in 0..depth {
             task_count = task_count.saturating_mul(self.primes[level]);
@@ -468,6 +510,11 @@ impl State {
     }
 }
 
+#[inline]
+fn should_prune(count: usize, max_count: usize, target: usize, records_target: bool) -> bool {
+    count < max_count && (!records_target || count < target)
+}
+
 fn progress_bar() -> ProgressBar {
     let pb = ProgressBar::new_spinner();
     pb.set_style(
@@ -480,7 +527,15 @@ fn progress_bar() -> ProgressBar {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_shift_table, State};
+    use super::{build_shift_table, should_prune, State};
+
+    #[test]
+    fn target_only_prevents_pruning_when_target_results_are_recorded() {
+        assert!(should_prune(2, 3, 1, false));
+        assert!(should_prune(2, 3, 4, true));
+        assert!(!should_prune(2, 3, 1, true));
+        assert!(!should_prune(3, 3, 4, true));
+    }
 
     #[test]
     fn build_shift_table_creates_expected_complement_masks() {

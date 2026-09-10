@@ -5,7 +5,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// 基底行の生成と補集合シフトテーブルの作成
@@ -16,14 +16,8 @@ pub fn build_shift_table(primes: &[usize], cols: usize) -> Vec<Vec<BitMask>> {
         let mut complement_shifts = Vec::with_capacity(p);
         for k in 0..p {
             let mut mask = BitMask::new_ones(cols);
-            for col in 0..cols {
-                let idx = col + 1;
-                if col >= k {
-                    let orig_idx = idx - k;
-                    if orig_idx % p == 1 {
-                        mask.set(col, false);
-                    }
-                }
+            for col in (k..cols).step_by(p) {
+                mask.set(col, false);
             }
             complement_shifts.push(mask);
         }
@@ -49,14 +43,16 @@ struct StackFrame {
 struct Checkpoint {
     depth: usize,
     primes: Vec<usize>,
-    limit: usize,
-    all: bool,
+    max_depth: usize,
+    target: usize,
     cols: usize,
     stack: Vec<StackFrame>,
     key: Vec<usize>,
     max_count: usize,
     results: usize,
     shifts: Vec<Vec<usize>>,
+    target_results: usize,
+    target_shifts: Vec<Vec<usize>>,
     node_count: u64,
 }
 
@@ -71,6 +67,8 @@ pub struct SharedResults {
     pub max_count: usize,
     pub results: usize,
     pub shifts: Vec<Vec<usize>>,
+    pub target_results: usize,
+    pub target_shifts: Vec<Vec<usize>>,
 }
 
 struct ParallelResults {
@@ -124,38 +122,33 @@ struct WorkItem {
 
 pub struct State {
     pub primes: Vec<usize>,
-    pub limit: usize,
     pub max_depth: usize,
     pub target: usize,
-    pub all: bool,
     pub key: Vec<usize>,
     pub zero_mask: BitMask,
     pub max_count: usize,
     pub results: usize,
     pub shifts: Vec<Vec<usize>>,
+    pub target_results: usize,
+    pub target_shifts: Vec<Vec<usize>>,
     pub node_count: u64,
     pub checkpoint_interval: u64,
     shift_table: Vec<Vec<BitMask>>,
 }
 
 impl State {
-    pub fn new(
-        primes: Vec<usize>,
-        limit: usize,
-        cols: usize,
-        shift_table: Vec<Vec<BitMask>>,
-    ) -> Self {
+    pub fn new(primes: Vec<usize>, cols: usize, shift_table: Vec<Vec<BitMask>>) -> Self {
         State {
             primes,
-            limit,
             max_depth: 249,
             target: 447,
-            all: false,
             key: Vec::new(),
             zero_mask: BitMask::new_ones(cols),
             max_count: 0,
             results: 0,
             shifts: Vec::new(),
+            target_results: 0,
+            target_shifts: Vec::new(),
             node_count: 0,
             checkpoint_interval: 100_000,
             shift_table,
@@ -173,12 +166,13 @@ impl State {
             let checkpoint: Checkpoint = serde_json::from_reader(std::fs::File::open(path)?)?;
             if checkpoint.depth != depth
                 || checkpoint.primes != self.primes
-                || checkpoint.limit != self.limit
+                || checkpoint.max_depth != self.max_depth
+                || checkpoint.target != self.target
                 || checkpoint.cols != self.zero_mask.size()
             {
                 return Err(format!(
-                    "チェックポイントの探索設定が現在の設定と一致しません (depth={}, limit={}, cols={})",
-                    checkpoint.depth, checkpoint.limit, checkpoint.cols
+                    "チェックポイントの探索設定が現在の設定と一致しません (depth={}, max_depth={}, target={}, cols={})",
+                    checkpoint.depth, checkpoint.max_depth, checkpoint.target, checkpoint.cols
                 )
                 .into());
             }
@@ -186,6 +180,8 @@ impl State {
             self.max_count = checkpoint.max_count;
             self.results = checkpoint.results;
             self.shifts = checkpoint.shifts;
+            self.target_results = checkpoint.target_results;
+            self.target_shifts = checkpoint.target_shifts;
             self.node_count = checkpoint.node_count;
             info!(
                 "チェックポイントから探索を再開しました (nodes={})",
@@ -246,37 +242,24 @@ impl State {
                 checkpoint_due = true;
             }
 
-            if count < self.limit {
-                self.key.pop();
-                continue;
-            }
-
-            if count < self.max_count {
+            if count < self.max_count && count < self.target {
                 self.key.pop();
                 continue;
             }
 
             if level + 1 >= depth {
-                if depth == self.max_depth && count == self.target {
-                    self.results += 1;
-                    self.shifts.push(self.key.clone());
-                    info!("target level={} key={:?} count={}", level, self.key, count);
-                    self.key.pop();
-                    if !self.all {
-                        break;
-                    }
-                    continue;
-                }
                 if count > self.max_count {
                     self.max_count = count;
                     self.results = 1;
                     self.shifts.clear();
                     self.shifts.push(self.key.clone());
-                    // info!("best level={} key={:?} count={}", level, self.key, count);
                 } else if count == self.max_count {
                     self.results += 1;
                     self.shifts.push(self.key.clone());
-                    // info!("best level={} key={:?} count={}", level, self.key, count);
+                }
+                if depth == self.max_depth && count == self.target {
+                    self.target_results += 1;
+                    self.target_shifts.push(self.key.clone());
                 }
                 self.key.pop();
                 continue;
@@ -316,14 +299,16 @@ impl State {
         let checkpoint = Checkpoint {
             depth,
             primes: self.primes.clone(),
-            limit: self.limit,
-            all: self.all,
+            max_depth: self.max_depth,
+            target: self.target,
             cols: self.zero_mask.size(),
             stack: stack_frames,
             key: self.key.clone(),
             max_count: self.max_count,
             results: self.results,
             shifts: self.shifts.clone(),
+            target_results: self.target_results,
+            target_shifts: self.target_shifts.clone(),
             node_count: self.node_count,
         };
         let file = fs::File::create(&temporary_path)?;
@@ -370,29 +355,21 @@ impl State {
             results: Mutex::new(SharedResults::default()),
         });
         let node_count = Arc::new(AtomicU64::new(0));
-        let stop = Arc::new(AtomicBool::new(false));
         let pb = progress_bar();
 
         let split_depth = self.parallel_split_depth(depth);
         let work_items = self.parallel_work_items(split_depth);
         work_items.into_par_iter().for_each(|work_item| {
-            if stop.load(Ordering::Relaxed) {
-                return;
-            }
-
             let mut key = work_item.key;
             let mut masks = vec![self.zero_mask.clone(); depth + 1];
             masks[split_depth] = work_item.base_mask;
             let count = masks[split_depth].count_ones();
             if split_depth == depth {
-                if depth == self.max_depth {
-                    if count == self.target && (self.all || !stop.swap(true, Ordering::Relaxed)) {
-                        let mut shared = results.results.lock().unwrap();
-                        shared.results += 1;
-                        shared.shifts.push(key);
-                    }
-                } else {
-                    results.record_best(count, &key);
+                results.record_best(count, &key);
+                if depth == self.max_depth && count == self.target {
+                    let mut shared = results.results.lock().unwrap();
+                    shared.target_results += 1;
+                    shared.target_shifts.push(key);
                 }
                 return;
             }
@@ -404,9 +381,6 @@ impl State {
             let mut local_nodes = 0_u64;
 
             while let Some(frame) = stack.last_mut() {
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
                 if frame.next_idx == 0 {
                     stack.pop();
                     if stack.last().is_some() {
@@ -437,29 +411,18 @@ impl State {
                     ));
                 }
 
-                if c_count < self.limit {
-                    key.pop();
-                    continue;
-                }
-
-                if c_count < results.max_count.load(Ordering::Relaxed) {
+                if c_count < results.max_count.load(Ordering::Relaxed) && c_count < self.target {
                     key.pop();
                     continue;
                 }
 
                 if level + 1 >= depth {
-                    if depth == self.max_depth {
-                        if c_count == self.target
-                            && (self.all || !stop.swap(true, Ordering::Relaxed))
-                        {
-                            let mut shared = results.results.lock().unwrap();
-                            shared.results += 1;
-                            shared.shifts.push(key.clone());
-                        }
-                        key.pop();
-                        continue;
-                    }
                     results.record_best(c_count, &key);
+                    if depth == self.max_depth && c_count == self.target {
+                        let mut shared = results.results.lock().unwrap();
+                        shared.target_results += 1;
+                        shared.target_shifts.push(key.clone());
+                    }
                     key.pop();
                     continue;
                 }
@@ -499,13 +462,10 @@ impl State {
             for item in work_items {
                 for shift in (0..self.primes[level]).rev() {
                     let mut base_mask = self.zero_mask.clone();
-                    let count = base_mask
-                        .bitand_into_count(&item.base_mask, &self.shift_table[level][shift]);
-                    if count >= self.limit {
-                        let mut key = item.key.clone();
-                        key.push(shift);
-                        next_items.push(WorkItem { key, base_mask });
-                    }
+                    base_mask.bitand_into_count(&item.base_mask, &self.shift_table[level][shift]);
+                    let mut key = item.key.clone();
+                    key.push(shift);
+                    next_items.push(WorkItem { key, base_mask });
                 }
             }
             work_items = next_items;
@@ -539,21 +499,19 @@ mod tests {
     }
 
     #[test]
-    fn sequential_and_parallel_search_find_valid_results() {
+    fn sequential_and_parallel_search_find_maximum_results() {
         let primes = vec![2, 3];
         let cols = 4;
         let table = build_shift_table(&primes, cols);
-        let mut sequential = State::new(primes.clone(), 1, cols, table.clone());
-        sequential.max_depth = 2;
-        sequential.target = 1;
+        let mut sequential = State::new(primes.clone(), cols, table.clone());
         sequential.search_with_checkpoint(2, None, None).unwrap();
-        let mut parallel = State::new(primes.clone(), 1, cols, table);
-        parallel.max_depth = 2;
-        parallel.target = 1;
+        let parallel = State::new(primes.clone(), cols, table);
         let result = parallel.search_parallel(2);
 
-        assert_eq!(sequential.results, 1);
-        assert!(result.results > 0);
+        assert_eq!(sequential.max_count, 2);
+        assert_eq!(sequential.results, 2);
+        assert_eq!(result.max_count, sequential.max_count);
+        assert_eq!(result.results, sequential.results);
         assert_eq!(result.shifts.len(), result.results);
         for shifts in &result.shifts {
             assert_eq!(shifts.len(), 2);
@@ -564,15 +522,15 @@ mod tests {
     }
 
     #[test]
-    fn sequential_and_parallel_search_record_all_best_leaves() {
+    fn sequential_and_parallel_search_record_all_maximum_leaves() {
         let primes = vec![2];
         let cols = 4;
         let table = build_shift_table(&primes, cols);
 
-        let mut sequential = State::new(primes.clone(), 1, cols, table.clone());
+        let mut sequential = State::new(primes.clone(), cols, table.clone());
         sequential.search_with_checkpoint(1, None, None).unwrap();
 
-        let parallel = State::new(primes, 1, cols, table);
+        let parallel = State::new(primes, cols, table);
         let result = parallel.search_parallel(1);
 
         assert_eq!(sequential.max_count, 2);
@@ -584,51 +542,42 @@ mod tests {
     }
 
     #[test]
-    fn all_flag_controls_target_match_count_in_both_search_modes() {
-        let primes = vec![2];
+    fn target_results_include_paths_below_the_maximum() {
+        let primes = vec![2, 3];
         let cols = 4;
         let table = build_shift_table(&primes, cols);
 
-        let mut sequential_one = State::new(primes.clone(), 1, cols, table.clone());
-        sequential_one.max_depth = 1;
-        sequential_one.target = 2;
-        sequential_one
-            .search_with_checkpoint(1, None, None)
-            .unwrap();
-        assert_eq!(sequential_one.results, 1);
+        let mut sequential = State::new(primes.clone(), cols, table.clone());
+        sequential.max_depth = 2;
+        sequential.target = 1;
+        sequential.search_with_checkpoint(2, None, None).unwrap();
 
-        let mut sequential_all = State::new(primes.clone(), 1, cols, table.clone());
-        sequential_all.max_depth = 1;
-        sequential_all.target = 2;
-        sequential_all.all = true;
-        sequential_all
-            .search_with_checkpoint(1, None, None)
-            .unwrap();
-        assert_eq!(sequential_all.results, 2);
+        let mut parallel = State::new(primes, cols, table);
+        parallel.max_depth = 2;
+        parallel.target = 1;
+        let result = parallel.search_parallel(2);
 
-        let mut parallel_one = State::new(primes.clone(), 1, cols, table.clone());
-        parallel_one.max_depth = 1;
-        parallel_one.target = 2;
-        assert_eq!(parallel_one.search_parallel(1).results, 1);
-
-        let mut parallel_all = State::new(primes, 1, cols, table);
-        parallel_all.max_depth = 1;
-        parallel_all.target = 2;
-        parallel_all.all = true;
-        assert_eq!(parallel_all.search_parallel(1).results, 2);
+        assert_eq!(sequential.max_count, 2);
+        assert_eq!(sequential.results, 2);
+        assert_eq!(sequential.target_results, 4);
+        assert_eq!(sequential.target_shifts.len(), 4);
+        assert_eq!(result.max_count, 2);
+        assert_eq!(result.results, 2);
+        assert_eq!(result.target_results, 4);
+        assert_eq!(result.target_shifts.len(), 4);
     }
 
     #[test]
     fn checkpoint_interval_defaults_to_100k() {
         let table = build_shift_table(&[2], 4);
-        let state = State::new(vec![2], 1, 4, table);
+        let state = State::new(vec![2], 4, table);
         assert_eq!(state.checkpoint_interval, 100_000);
     }
 
     #[test]
     fn checkpoint_interval_can_be_set() {
         let table = build_shift_table(&[2], 4);
-        let mut state = State::new(vec![2], 1, 4, table);
+        let mut state = State::new(vec![2], 4, table);
         state.checkpoint_interval = 5_000;
         assert_eq!(state.checkpoint_interval, 5_000);
     }
@@ -638,7 +587,7 @@ mod tests {
         let primes = vec![2, 3];
         let cols = 4;
         let table = build_shift_table(&primes, cols);
-        let mut state = State::new(primes.clone(), 1, cols, table);
+        let mut state = State::new(primes.clone(), cols, table);
 
         state.key = vec![1, 0];
         state.node_count = 10;
@@ -677,8 +626,8 @@ mod tests {
         let checkpoint = super::Checkpoint {
             depth: 2,
             primes: vec![2, 3],
-            limit: 1,
-            all: false,
+            max_depth: 2,
+            target: 1,
             cols: 4,
             stack: vec![super::StackFrame {
                 level: 0,
@@ -688,6 +637,8 @@ mod tests {
             max_count: 2,
             results: 0,
             shifts: vec![],
+            target_results: 0,
+            target_shifts: vec![],
             node_count: 100,
         };
         let json = serde_json::to_string_pretty(&checkpoint).unwrap();
@@ -700,42 +651,11 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_can_resume_with_a_different_all_setting() {
-        let primes = vec![2];
-        let cols = 4;
-        let table = build_shift_table(&primes, cols);
-        let path = std::env::temp_dir().join(format!(
-            "hlsearch-checkpoint-all-{}-{}.json",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-
-        let mut saved = State::new(primes.clone(), 1, cols, table.clone());
-        saved.all = true;
-        let stack = vec![super::Frame {
-            level: 0,
-            next_idx: 2,
-        }];
-        saved.write_checkpoint(&path, 1, &stack).unwrap();
-
-        let mut resumed = State::new(primes, 1, cols, table);
-        resumed.all = false;
-        resumed
-            .search_with_checkpoint(1, Some(&path), Some(&path))
-            .unwrap();
-
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
     fn multiple_keys_rebuild_to_correct_masks() {
         let primes = vec![2, 3, 5];
         let cols = 8;
         let table = build_shift_table(&primes, cols);
-        let mut state = State::new(primes.clone(), 1, cols, table);
+        let mut state = State::new(primes.clone(), cols, table);
 
         state.key = vec![1, 2, 1];
 

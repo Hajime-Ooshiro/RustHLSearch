@@ -27,10 +27,8 @@ struct OutputFile<'a> {
 struct OutputConfig<'a> {
     mode: &'a str,
     depth: usize,
-    limit: usize,
     max_depth: usize,
     target: usize,
-    all: bool,
     cols: usize,
     primes_count: &'a str,
     elapsed: String,
@@ -41,6 +39,8 @@ struct OutputResult<'a> {
     max_count: usize,
     results: usize,
     shifts: &'a [Vec<usize>],
+    target_results: usize,
+    target_shifts: &'a [Vec<usize>],
 }
 
 #[derive(Parser, Debug)]
@@ -58,17 +58,11 @@ pub struct Cli {
     )]
     pub mode: SearchMode,
 
-    #[arg(short, long, default_value_t = 447, help = "枝刈り下限値")]
-    pub limit: usize,
-
-    #[arg(long, default_value_t = 249, help = "打ち切り判定用 max-depth")]
+    #[arg(long, default_value_t = 249, help = "target 判定を行う探索深さ")]
     pub max_depth: usize,
 
-    #[arg(short, long, default_value_t = 447, help = "打ち切り目標値")]
+    #[arg(short, long, default_value_t = 447, help = "記録対象の popcount")]
     pub target: usize,
-
-    #[arg(long, help = "ターゲット一致の全件を検索する")]
-    pub all: bool,
 
     #[arg(long, default_value_t = 3159, help = "列数 (長さ)")]
     pub cols: usize,
@@ -100,11 +94,14 @@ impl Cli {
         if self.cols == 0 {
             return Err("cols must be at least 1".to_string());
         }
-        if self.limit > self.cols {
+        if self.target > self.cols {
             return Err(format!(
-                "limit ({}) cannot exceed cols ({})",
-                self.limit, self.cols
+                "target ({}) cannot exceed cols ({})",
+                self.target, self.cols
             ));
+        }
+        if self.checkpoint_interval == 0 {
+            return Err("checkpoint-interval must be at least 1".to_string());
         }
         if let Some(primes_count) = self.primes_count {
             if primes_count == 0 {
@@ -149,22 +146,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("HLSearch (Rust) 開始");
     info!(
-        "設定: mode={:?} depth={} limit={} max_depth={} target={} all={} primes_count={}",
+        "設定: mode={:?} depth={} max_depth={} target={} primes_count={}",
         cli.mode,
         cli.depth,
-        cli.limit,
         cli.max_depth,
         cli.target,
-        cli.all,
         primes.len()
     );
 
     let start_time = Instant::now();
     let shift_table = build_shift_table(&primes[..cli.depth], cli.cols);
-    let mut state = State::new(primes, cli.limit, cli.cols, shift_table);
+    let mut state = State::new(primes, cli.cols, shift_table);
     state.max_depth = cli.max_depth;
     state.target = cli.target;
-    state.all = cli.all;
     state.checkpoint_interval = cli.checkpoint_interval;
 
     match cli.mode {
@@ -217,10 +211,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 SearchMode::Parallel => "parallel",
             },
             depth: cli.depth,
-            limit: cli.limit,
             max_depth: cli.max_depth,
             target: cli.target,
-            all: cli.all,
             cols: cli.cols,
             primes_count: &primes_count,
             elapsed: format!("{elapsed:?}"),
@@ -229,6 +221,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_count: state.max_count,
             results: state.results,
             shifts: &state.shifts,
+            target_results: state.target_results,
+            target_shifts: &state.target_shifts,
         },
     };
     serde_json::to_writer_pretty(&mut writer, &output)?;
@@ -246,10 +240,8 @@ mod tests {
         Cli {
             depth: 1,
             mode: SearchMode::Sequential,
-            limit: 1,
             max_depth: 249,
-            target: 447,
-            all: false,
+            target: 1,
             cols: 4,
             primes_count: None,
             output: PathBuf::from("shift_path.txt"),
@@ -271,8 +263,17 @@ mod tests {
         cli.cols = 0;
         assert!(cli.validate(3).is_err());
         cli = test_cli();
-        cli.limit = 5;
-        assert!(cli.validate(3).is_err());
+        cli.target = 5;
+        assert_eq!(
+            cli.validate(3).unwrap_err(),
+            "target (5) cannot exceed cols (4)"
+        );
+        cli = test_cli();
+        cli.checkpoint_interval = 0;
+        assert_eq!(
+            cli.validate(3).unwrap_err(),
+            "checkpoint-interval must be at least 1"
+        );
         cli = test_cli();
         cli.primes_count = Some(4);
         assert!(cli.validate(3).is_err());
@@ -305,18 +306,12 @@ mod tests {
     }
 
     #[test]
-    fn cli_validation_rejects_depth_above_available_primes_without_limit() {
+    fn cli_validation_rejects_depth_above_available_primes() {
         let mut cli = test_cli();
         cli.depth = 4;
         assert_eq!(
             cli.validate(3).unwrap_err(),
             "depth (4) cannot exceed available primes (3)"
         );
-    }
-
-    #[test]
-    fn cli_all_flag_defaults_to_false_and_can_be_enabled() {
-        assert!(!Cli::try_parse_from(["hlsearch"]).unwrap().all);
-        assert!(Cli::try_parse_from(["hlsearch", "--all"]).unwrap().all);
     }
 }

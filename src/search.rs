@@ -8,6 +8,39 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+#[cfg(feature = "cuda")]
+use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
+#[cfg(feature = "cuda")]
+use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
+
+#[cfg(feature = "cuda")]
+const CUDA_KERNEL: &str = r#"
+extern "C" __global__ void batch_and_popcount(
+    const unsigned long long* masks,
+    const unsigned int* candidate_masks,
+    unsigned int* counts,
+    unsigned int words,
+    unsigned int depth,
+    unsigned int candidate_count
+) {
+    const unsigned int candidate = blockIdx.x * blockDim.x + threadIdx.x;
+    if (candidate >= candidate_count) {
+        return;
+    }
+
+    unsigned int count = 0;
+    for (unsigned int word = 0; word < words; ++word) {
+        unsigned long long value = ~0ULL;
+        for (unsigned int level = 0; level < depth; ++level) {
+            const unsigned int mask = candidate_masks[candidate * depth + level];
+            value &= masks[mask * words + word];
+        }
+        count += __popcll(value);
+    }
+    counts[candidate] = count;
+}
+"#;
+
 /// 基底行の生成と補集合シフトテーブルの作成
 pub fn build_shift_table(primes: &[usize], cols: usize) -> Vec<Vec<BitMask>> {
     let mut shift_table = Vec::with_capacity(primes.len());
@@ -60,6 +93,7 @@ struct Checkpoint {
 pub enum SearchMode {
     Sequential,
     Parallel,
+    Cuda,
 }
 
 #[derive(Clone, Default)]
@@ -138,6 +172,50 @@ impl SharedResults {
 struct WorkItem {
     key: Vec<usize>,
     base_mask: BitMask,
+}
+
+#[cfg(any(feature = "cuda", test))]
+struct BoundedBatchPaths<'a> {
+    params: &'a [Vec<usize>],
+    positions: Vec<usize>,
+    exhausted: bool,
+}
+
+#[cfg(any(feature = "cuda", test))]
+impl<'a> BoundedBatchPaths<'a> {
+    fn new(params: &'a [Vec<usize>]) -> Self {
+        Self {
+            params,
+            positions: params
+                .iter()
+                .map(|candidates| candidates.len() - 1)
+                .collect(),
+            exhausted: params.is_empty(),
+        }
+    }
+
+    fn next_path(&mut self) -> Option<Vec<usize>> {
+        if self.exhausted {
+            return None;
+        }
+
+        let path = self
+            .params
+            .iter()
+            .zip(&self.positions)
+            .map(|(candidates, &position)| candidates[position])
+            .collect();
+
+        for level in (0..self.positions.len()).rev() {
+            if self.positions[level] > 0 {
+                self.positions[level] -= 1;
+                return Some(path);
+            }
+            self.positions[level] = self.params[level].len() - 1;
+        }
+        self.exhausted = true;
+        Some(path)
+    }
 }
 
 pub struct State {
@@ -516,6 +594,148 @@ impl State {
         results.snapshot()
     }
 
+    #[cfg(feature = "cuda")]
+    pub fn search_cuda_bounded(&mut self, depth: usize, batch_size: usize) -> Result<(), String> {
+        if depth == 0 || depth > self.params.len() {
+            return Err(format!(
+                "CUDA search depth ({depth}) must be between 1 and {}",
+                self.params.len()
+            ));
+        }
+        if batch_size
+            .checked_mul(depth)
+            .and_then(|size| u32::try_from(size).ok())
+            .is_none()
+        {
+            return Err("CUDA batch-size multiplied by depth must not exceed u32::MAX".to_string());
+        }
+        let words = self.zero_mask.words().len();
+        let (host_masks, mask_offsets) = self.cuda_masks();
+        u32::try_from(host_masks.len())
+            .map_err(|_| "CUDA search supports at most u32::MAX mask words".to_string())?;
+        let words_u32 = u32::try_from(words)
+            .map_err(|_| "CUDA search supports at most u32::MAX mask words".to_string())?;
+        let depth_u32 = u32::try_from(depth)
+            .map_err(|_| "CUDA search supports at most u32::MAX levels".to_string())?;
+
+        let context = CudaContext::new(0)
+            .map_err(|error| format!("CUDA device 0 の初期化に失敗しました: {error:?}"))?;
+        let stream = context.default_stream();
+        let ptx = compile_ptx_with_opts(
+            CUDA_KERNEL,
+            CompileOptions {
+                arch: Some("compute_86"),
+                ..Default::default()
+            },
+        )
+        .map_err(|error| format!("CUDA カーネルのコンパイルに失敗しました: {error:?}"))?;
+        let module = context
+            .load_module(ptx)
+            .map_err(|error| format!("CUDA モジュールのロードに失敗しました: {error:?}"))?;
+        let function = module
+            .load_function("batch_and_popcount")
+            .map_err(|error| format!("CUDA カーネルの取得に失敗しました: {error:?}"))?;
+        let device_masks = stream
+            .clone_htod(&host_masks)
+            .map_err(|error| format!("CUDA マスク転送に失敗しました: {error:?}"))?;
+        let mut paths = BoundedBatchPaths::new(&self.params[..depth]);
+        let pb = progress_bar();
+
+        loop {
+            let mut batch_paths = Vec::with_capacity(batch_size);
+            let mut candidate_masks = Vec::with_capacity(batch_size.saturating_mul(depth));
+            for _ in 0..batch_size {
+                let Some(path) = paths.next_path() else {
+                    break;
+                };
+                for (level, &shift) in path.iter().enumerate() {
+                    let mask = mask_offsets[level] + shift;
+                    candidate_masks.push(u32::try_from(mask).map_err(|_| {
+                        "CUDA search supports at most u32::MAX shift masks".to_string()
+                    })?);
+                }
+                batch_paths.push(path);
+            }
+            if batch_paths.is_empty() {
+                break;
+            }
+
+            let candidate_count = u32::try_from(batch_paths.len())
+                .map_err(|_| "CUDA batch-size must not exceed u32::MAX".to_string())?;
+            let device_candidates = stream
+                .clone_htod(&candidate_masks)
+                .map_err(|error| format!("CUDA 候補転送に失敗しました: {error:?}"))?;
+            let mut device_counts = stream
+                .alloc_zeros::<u32>(batch_paths.len())
+                .map_err(|error| format!("CUDA 結果バッファの確保に失敗しました: {error:?}"))?;
+
+            let mut launch = stream.launch_builder(&function);
+            launch.arg(&device_masks);
+            launch.arg(&device_candidates);
+            launch.arg(&mut device_counts);
+            launch.arg(&words_u32);
+            launch.arg(&depth_u32);
+            launch.arg(&candidate_count);
+            unsafe {
+                launch
+                    .launch(LaunchConfig::for_num_elems(candidate_count))
+                    .map_err(|error| format!("CUDA カーネル実行に失敗しました: {error:?}"))?;
+            }
+            let counts = stream
+                .clone_dtoh(&device_counts)
+                .map_err(|error| format!("CUDA 結果転送に失敗しました: {error:?}"))?;
+
+            for (path, count) in batch_paths.iter().zip(counts) {
+                let count = count as usize;
+                if count > self.max_count {
+                    self.max_count = count;
+                    self.results = 1;
+                    self.shifts.clear();
+                    self.shifts.push(path.clone());
+                } else if count == self.max_count {
+                    self.results += 1;
+                    self.shifts.push(path.clone());
+                }
+                if depth == self.max_depth && count == self.target {
+                    self.target_results += 1;
+                    self.target_shifts.push(path.clone());
+                }
+            }
+            self.node_count += batch_paths.len() as u64;
+            pb.set_position(self.node_count);
+            pb.set_message(format!(
+                "best: {} | hits: {} | batch: {}",
+                self.max_count,
+                self.results,
+                batch_paths.len()
+            ));
+        }
+
+        pb.finish_with_message("CUDA バッチ探索完了");
+        Ok(())
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    pub fn search_cuda_bounded(&mut self, _depth: usize, _batch_size: usize) -> Result<(), String> {
+        Err(
+            "CUDA モードには CUDA 機能を有効にしてください: cargo run --features cuda -- --mode cuda"
+                .to_string(),
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_masks(&self) -> (Vec<u64>, Vec<usize>) {
+        let mut masks = Vec::new();
+        let mut offsets = Vec::with_capacity(self.shift_table.len());
+        for shifts in &self.shift_table {
+            offsets.push(masks.len() / self.zero_mask.words().len());
+            for mask in shifts {
+                masks.extend_from_slice(mask.words());
+            }
+        }
+        (masks, offsets)
+    }
+
     fn parallel_split_depth(&self, depth: usize, target_tasks: usize) -> usize {
         let mut task_count: usize = 1;
         for level in 0..depth {
@@ -673,6 +893,16 @@ mod tests {
             state.params,
             vec![vec![1], vec![1, 2], vec![2, 3, 4], vec![3, 4, 5, 6]]
         );
+    }
+
+    #[test]
+    fn bounded_batch_paths_keep_the_sequential_descending_order() {
+        let candidates = vec![vec![1], vec![1, 2], vec![2, 3, 4]];
+        let mut paths = super::BoundedBatchPaths::new(&candidates);
+        assert_eq!(paths.next_path(), Some(vec![1, 2, 4]));
+        assert_eq!(paths.next_path(), Some(vec![1, 2, 3]));
+        assert_eq!(paths.next_path(), Some(vec![1, 2, 2]));
+        assert_eq!(paths.next_path(), Some(vec![1, 1, 4]));
     }
 
     #[test]

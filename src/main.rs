@@ -31,6 +31,7 @@ struct OutputConfig<'a> {
     target: usize,
     cols: usize,
     parallel_tasks_per_thread: usize,
+    cuda_batch_size: usize,
     elapsed: String,
 }
 
@@ -54,7 +55,7 @@ pub struct Cli {
         long,
         value_enum,
         default_value_t = SearchMode::Parallel,
-        help = "探索モード (sequential | parallel)"
+        help = "探索モード (sequential | parallel | cuda)"
     )]
     pub mode: SearchMode,
 
@@ -84,6 +85,13 @@ pub struct Cli {
 
     #[arg(long, default_value_t = 4, help = "並列時のスレッド当たりタスク数")]
     pub parallel_tasks_per_thread: usize,
+
+    #[arg(
+        long,
+        default_value_t = 8_192,
+        help = "CUDA bounded バッチの候補パス数"
+    )]
+    pub cuda_batch_size: usize,
 }
 
 impl Cli {
@@ -105,6 +113,9 @@ impl Cli {
         }
         if self.parallel_tasks_per_thread == 0 {
             return Err("parallel-tasks-per-thread must be at least 1".to_string());
+        }
+        if self.cuda_batch_size == 0 {
+            return Err("cuda-batch-size must be at least 1".to_string());
         }
         if self.depth > available_primes {
             return Err(format!(
@@ -168,6 +179,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             state.target_results = result.target_results;
             state.target_shifts = result.target_shifts;
         }
+        SearchMode::Cuda => {
+            if Path::new(CHECKPOINT_PATH).exists() {
+                return Err(
+                    "checkpoint.json は sequential モードでのみ再開できます。--mode sequential を指定してください"
+                        .into(),
+                );
+            }
+            state
+                .search_cuda_bounded(cli.depth, cli.cuda_batch_size)
+                .map_err(std::io::Error::other)?;
+        }
     }
 
     let elapsed = start_time.elapsed();
@@ -188,12 +210,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             mode: match cli.mode {
                 SearchMode::Sequential => "sequential",
                 SearchMode::Parallel => "parallel",
+                SearchMode::Cuda => "cuda",
             },
             depth: cli.depth,
             max_depth: cli.max_depth,
             target: cli.target,
             cols: cli.cols,
             parallel_tasks_per_thread: cli.parallel_tasks_per_thread,
+            cuda_batch_size: cli.cuda_batch_size,
             elapsed: format!("{elapsed:?}"),
         },
         result: OutputResult {
@@ -225,6 +249,7 @@ mod tests {
             output: PathBuf::from("shift_path.txt"),
             checkpoint_interval: 100_000,
             parallel_tasks_per_thread: 4,
+            cuda_batch_size: 8_192,
         }
     }
 
@@ -258,6 +283,12 @@ mod tests {
         assert_eq!(
             cli.validate(3).unwrap_err(),
             "parallel-tasks-per-thread must be at least 1"
+        );
+        cli = test_cli();
+        cli.cuda_batch_size = 0;
+        assert_eq!(
+            cli.validate(3).unwrap_err(),
+            "cuda-batch-size must be at least 1"
         );
     }
 

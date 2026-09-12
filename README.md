@@ -23,6 +23,16 @@ cargo build --release
 
 バイナリは `target/release/hlsearch`（Windows では `target/release/hlsearch.exe`）に出力されます。
 
+### CUDA バックエンド
+
+CUDA モードはオプション機能です。CUDA Toolkit 11.8 と NVIDIA ドライバを使用できる環境では、次のようにビルド・実行します。
+
+```bash
+cargo run --release --features cuda -- --mode cuda --depth 8 --cuda-batch-size 8192
+```
+
+通常の `cargo build` / `cargo test` は CUDA SDK を必要としません。CUDA モードを CUDA 機能なしで指定した場合は、再ビルド方法を含むエラーを返します。
+
 ### Windows 用バッチファイル
 
 Windows 環境向けに `build.bat` も用意されています（デバッグビルドおよびリリースビルドを順に実行）。
@@ -105,6 +115,8 @@ cargo run --release -- --depth 10 --max-depth 10 --target 400 -o result.json
 > **Note**: 並列モード時のスレッド数は Rayon の既定値（論理コア数）となります。環境変数 `RAYON_NUM_THREADS` でスレッド数を指定可能です。
 > タスク数は既定でスレッド数の4倍です。枝ごとの探索量に偏りがある場合は、`--parallel-tasks-per-thread` を増やして負荷分散を調整できます。
 
+CUDA の bounded バッチ探索は、候補パスを降順に固定サイズのチャンクへ分けます。各チャンクでは GPU が全レベルの補集合マスクの AND と popcount を実行し、CPU は返却された popcount から最大値・最大値パス・target パスを記録します。既定の `--cuda-batch-size 8192` は GPU メモリ使用量と転送回数のバランスを取った値です。
+
 ### 入力値の検証
 
 実行開始前に次の条件を検証します。条件に違反した場合はエラーを表示して終了します。
@@ -134,6 +146,7 @@ cargo run --release -- --depth 10 --max-depth 10 --target 400 -o result.json
 
 - `--mode parallel`（デフォルト）: Rayon のワーカ数に応じて先頭の複数階層を分割し、複数スレッドで並列 DFS します。各階層のシフト候補は降順で処理されます。
 - `--mode sequential`: 単一スレッドで決定論的に非再帰 DFS を実行します。
+- `--mode cuda`: CUDA GPU 上で bounded バッチごとに全候補の AND / popcount を実行します。CUDA feature を有効にしてビルドする必要があります。
 
 並列モードではスレッドの実行順序により、記録される最大値パスおよび target パスの順序が逐次モードと異なる場合があります。
 
@@ -142,11 +155,12 @@ cargo run --release -- --depth 10 --max-depth 10 --target 400 -o result.json
 | フラグ | 短縮 | 既定値 | 説明 |
 | --- | --- | --- | --- |
 | `--depth` | `-d` | `8` | 探索する階層数（使用する素数の個数） |
-| `--mode` | `-m` | `parallel` | 探索モード（`parallel` または `sequential`） |
+| `--mode` | `-m` | `parallel` | 探索モード（`parallel`、`sequential`、または `cuda`） |
 | `--cols` | | `3159` | ビット列の長さ |
 | `--output` | `-o` | `shift_path.json` | JSON出力ファイルパス（実行時にタイムスタンプが挿入されます） |
 | `--checkpoint-interval` | | `100000` | チェックポイント保存周期 (ノード数) |
 | `--parallel-tasks-per-thread` | | `4` | 並列時のスレッド当たりタスク数 |
+| `--cuda-batch-size` | | `8192` | CUDA bounded バッチの候補パス数 |
 | `--max-depth` | | `249` | target 判定を行う探索深さ |
 | `--target` | `-t` | `447` | `max-depth` 時に記録対象とする popcount |
 

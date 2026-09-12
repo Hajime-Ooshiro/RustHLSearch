@@ -133,8 +133,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let start_time = Instant::now();
-    let shift_table = build_shift_table(&all_primes[..cli.depth], cli.cols);
-    let mut state = State::new(all_primes, cli.cols, shift_table);
+    let search_primes = all_primes[..cli.depth].to_vec();
+    let shift_table = build_shift_table(&search_primes, cli.cols);
+    let mut state =
+        State::new(search_primes, cli.cols, shift_table).map_err(std::io::Error::other)?;
     state.max_depth = cli.max_depth;
     state.target = cli.target;
     state.checkpoint_interval = cli.checkpoint_interval;

@@ -159,13 +159,47 @@ pub struct State {
 }
 
 impl State {
-    pub fn new(primes: Vec<usize>, cols: usize, shift_table: Vec<Vec<BitMask>>) -> Self {
+    pub fn new(
+        primes: Vec<usize>,
+        cols: usize,
+        shift_table: Vec<Vec<BitMask>>,
+    ) -> Result<Self, String> {
+        if primes.is_empty() {
+            return Err("primes must contain at least one value".to_string());
+        }
+        if cols == 0 {
+            return Err("cols must be at least 1".to_string());
+        }
+        if shift_table.len() != primes.len() {
+            return Err(format!(
+                "shift_table level count ({}) must match primes count ({})",
+                shift_table.len(),
+                primes.len()
+            ));
+        }
+        for (level, (&prime, shifts)) in primes.iter().zip(&shift_table).enumerate() {
+            if prime < 2 {
+                return Err(format!("prime at level {level} must be at least 2"));
+            }
+            if shifts.len() != prime {
+                return Err(format!(
+                    "shift_table at level {level} contains {} shifts; expected {prime}",
+                    shifts.len()
+                ));
+            }
+            if shifts.iter().any(|mask| mask.size() != cols) {
+                return Err(format!(
+                    "shift_table at level {level} contains a mask with a different column count"
+                ));
+            }
+        }
+
         let params = primes
             .iter()
             .map(|&prime| (prime / 2..prime).collect())
             .collect();
 
-        State {
+        Ok(State {
             primes,
             params,
             max_depth: 249,
@@ -181,7 +215,7 @@ impl State {
             checkpoint_interval: 100_000,
             parallel_tasks_per_thread: 4,
             shift_table,
-        }
+        })
     }
 
     pub fn search_with_checkpoint(
@@ -558,9 +592,9 @@ mod tests {
         let primes = vec![2, 3];
         let cols = 4;
         let table = build_shift_table(&primes, cols);
-        let mut sequential = State::new(primes.clone(), cols, table.clone());
+        let mut sequential = State::new(primes.clone(), cols, table.clone()).unwrap();
         sequential.search_with_checkpoint(2, None, None).unwrap();
-        let parallel = State::new(primes.clone(), cols, table);
+        let parallel = State::new(primes.clone(), cols, table).unwrap();
         let result = parallel.search_parallel(2);
 
         assert_eq!(sequential.max_count, 2);
@@ -582,10 +616,10 @@ mod tests {
         let cols = 4;
         let table = build_shift_table(&primes, cols);
 
-        let mut sequential = State::new(primes.clone(), cols, table.clone());
+        let mut sequential = State::new(primes.clone(), cols, table.clone()).unwrap();
         sequential.search_with_checkpoint(1, None, None).unwrap();
 
-        let parallel = State::new(primes, cols, table);
+        let parallel = State::new(primes, cols, table).unwrap();
         let result = parallel.search_parallel(1);
 
         assert_eq!(sequential.max_count, 2);
@@ -602,12 +636,12 @@ mod tests {
         let cols = 4;
         let table = build_shift_table(&primes, cols);
 
-        let mut sequential = State::new(primes.clone(), cols, table.clone());
+        let mut sequential = State::new(primes.clone(), cols, table.clone()).unwrap();
         sequential.max_depth = 2;
         sequential.target = 1;
         sequential.search_with_checkpoint(2, None, None).unwrap();
 
-        let mut parallel = State::new(primes, cols, table);
+        let mut parallel = State::new(primes, cols, table).unwrap();
         parallel.max_depth = 2;
         parallel.target = 1;
         let result = parallel.search_parallel(2);
@@ -625,7 +659,7 @@ mod tests {
     #[test]
     fn checkpoint_interval_defaults_to_100k() {
         let table = build_shift_table(&[2], 4);
-        let state = State::new(vec![2], 4, table);
+        let state = State::new(vec![2], 4, table).unwrap();
         assert_eq!(state.checkpoint_interval, 100_000);
     }
 
@@ -633,7 +667,7 @@ mod tests {
     fn params_contain_ranges_from_half_to_one_before_each_prime() {
         let primes = vec![2, 3, 5, 7];
         let table = build_shift_table(&primes, 8);
-        let state = State::new(primes, 8, table);
+        let state = State::new(primes, 8, table).unwrap();
 
         assert_eq!(
             state.params,
@@ -642,9 +676,22 @@ mod tests {
     }
 
     #[test]
+    fn state_creation_rejects_inconsistent_shift_table() {
+        let error = match State::new(vec![2], 4, Vec::new()) {
+            Ok(_) => panic!("inconsistent shift table must be rejected"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error,
+            "shift_table level count (0) must match primes count (1)"
+        );
+    }
+
+    #[test]
     fn checkpoint_interval_can_be_set() {
         let table = build_shift_table(&[2], 4);
-        let mut state = State::new(vec![2], 4, table);
+        let mut state = State::new(vec![2], 4, table).unwrap();
         state.checkpoint_interval = 5_000;
         assert_eq!(state.checkpoint_interval, 5_000);
     }
@@ -654,7 +701,7 @@ mod tests {
         let primes = vec![2, 3];
         let cols = 4;
         let table = build_shift_table(&primes, cols);
-        let mut state = State::new(primes.clone(), cols, table);
+        let mut state = State::new(primes.clone(), cols, table).unwrap();
 
         state.key = vec![1, 0];
         state.node_count = 10;
@@ -722,7 +769,7 @@ mod tests {
         let primes = vec![2, 3, 5];
         let cols = 8;
         let table = build_shift_table(&primes, cols);
-        let mut state = State::new(primes.clone(), cols, table);
+        let mut state = State::new(primes.clone(), cols, table).unwrap();
 
         state.key = vec![1, 2, 1];
 

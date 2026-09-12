@@ -142,6 +142,7 @@ struct WorkItem {
 
 pub struct State {
     pub primes: Vec<usize>,
+    pub params: Vec<Vec<usize>>,
     pub max_depth: usize,
     pub target: usize,
     pub key: Vec<usize>,
@@ -159,8 +160,14 @@ pub struct State {
 
 impl State {
     pub fn new(primes: Vec<usize>, cols: usize, shift_table: Vec<Vec<BitMask>>) -> Self {
+        let params = primes
+            .iter()
+            .map(|&prime| (prime / 2..prime).collect())
+            .collect();
+
         State {
             primes,
+            params,
             max_depth: 249,
             target: 447,
             key: Vec::new(),
@@ -214,7 +221,7 @@ impl State {
         } else {
             vec![Frame {
                 level: 0,
-                next_idx: self.primes[0],
+                next_idx: self.params[0].len(),
             }]
         };
         let mut masks = self.rebuild_masks(depth);
@@ -237,8 +244,8 @@ impl State {
             }
 
             frame.next_idx -= 1;
-            let i = frame.next_idx;
             let level = frame.level;
+            let i = self.params[level][frame.next_idx];
             self.key.push(i);
             self.node_count += 1;
 
@@ -282,7 +289,7 @@ impl State {
 
             stack.push(Frame {
                 level: level + 1,
-                next_idx: self.primes[level + 1],
+                next_idx: self.params[level + 1].len(),
             });
         }
         pb.finish_with_message("探索完了");
@@ -405,7 +412,7 @@ impl State {
             }
             let mut stack = vec![Frame {
                 level: split_depth,
-                next_idx: self.primes[split_depth],
+                next_idx: self.params[split_depth].len(),
             }];
             let mut local_nodes = 0_u64;
 
@@ -419,8 +426,8 @@ impl State {
                 }
 
                 frame.next_idx -= 1;
-                let idx = frame.next_idx;
                 let level = frame.level;
+                let idx = self.params[level][frame.next_idx];
                 key.push(idx);
                 local_nodes += 1;
                 let (base_masks, node_masks) = masks.split_at_mut(level + 1);
@@ -464,7 +471,7 @@ impl State {
 
                 stack.push(Frame {
                     level: level + 1,
-                    next_idx: self.primes[level + 1],
+                    next_idx: self.params[level + 1].len(),
                 });
             }
             node_count.fetch_add(local_nodes, Ordering::Relaxed);
@@ -478,7 +485,7 @@ impl State {
     fn parallel_split_depth(&self, depth: usize, target_tasks: usize) -> usize {
         let mut task_count: usize = 1;
         for level in 0..depth {
-            task_count = task_count.saturating_mul(self.primes[level]);
+            task_count = task_count.saturating_mul(self.params[level].len());
             if task_count >= target_tasks {
                 return level + 1;
             }
@@ -493,9 +500,9 @@ impl State {
         }];
 
         for level in 0..split_depth {
-            let mut next_items = Vec::with_capacity(work_items.len() * self.primes[level]);
+            let mut next_items = Vec::with_capacity(work_items.len() * self.params[level].len());
             for item in work_items {
-                for shift in (0..self.primes[level]).rev() {
+                for &shift in self.params[level].iter().rev() {
                     let mut base_mask = self.zero_mask.clone();
                     base_mask.bitand_into_count(&item.base_mask, &self.shift_table[level][shift]);
                     let mut key = item.key.clone();
@@ -557,14 +564,14 @@ mod tests {
         let result = parallel.search_parallel(2);
 
         assert_eq!(sequential.max_count, 2);
-        assert_eq!(sequential.results, 2);
+        assert_eq!(sequential.results, 1);
         assert_eq!(result.max_count, sequential.max_count);
         assert_eq!(result.results, sequential.results);
         assert_eq!(result.shifts.len(), result.results);
         for shifts in &result.shifts {
             assert_eq!(shifts.len(), 2);
             for (level, &shift) in shifts.iter().enumerate() {
-                assert!(shift < primes[level]);
+                assert!(parallel.params[level].contains(&shift));
             }
         }
     }
@@ -582,11 +589,11 @@ mod tests {
         let result = parallel.search_parallel(1);
 
         assert_eq!(sequential.max_count, 2);
-        assert_eq!(sequential.results, 2);
-        assert_eq!(sequential.shifts, vec![vec![1], vec![0]]);
+        assert_eq!(sequential.results, 1);
+        assert_eq!(sequential.shifts, vec![vec![1]]);
         assert_eq!(result.max_count, 2);
-        assert_eq!(result.results, 2);
-        assert_eq!(result.shifts.len(), 2);
+        assert_eq!(result.results, 1);
+        assert_eq!(result.shifts, vec![vec![1]]);
     }
 
     #[test]
@@ -606,13 +613,13 @@ mod tests {
         let result = parallel.search_parallel(2);
 
         assert_eq!(sequential.max_count, 2);
-        assert_eq!(sequential.results, 2);
-        assert_eq!(sequential.target_results, 4);
-        assert_eq!(sequential.target_shifts.len(), 4);
+        assert_eq!(sequential.results, 1);
+        assert_eq!(sequential.target_results, 1);
+        assert_eq!(sequential.target_shifts.len(), 1);
         assert_eq!(result.max_count, 2);
-        assert_eq!(result.results, 2);
-        assert_eq!(result.target_results, 4);
-        assert_eq!(result.target_shifts.len(), 4);
+        assert_eq!(result.results, 1);
+        assert_eq!(result.target_results, 1);
+        assert_eq!(result.target_shifts.len(), 1);
     }
 
     #[test]
@@ -620,6 +627,18 @@ mod tests {
         let table = build_shift_table(&[2], 4);
         let state = State::new(vec![2], 4, table);
         assert_eq!(state.checkpoint_interval, 100_000);
+    }
+
+    #[test]
+    fn params_contain_ranges_from_half_to_one_before_each_prime() {
+        let primes = vec![2, 3, 5, 7];
+        let table = build_shift_table(&primes, 8);
+        let state = State::new(primes, 8, table);
+
+        assert_eq!(
+            state.params,
+            vec![vec![1], vec![1, 2], vec![2, 3, 4], vec![3, 4, 5, 6]]
+        );
     }
 
     #[test]

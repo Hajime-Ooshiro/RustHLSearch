@@ -9,7 +9,7 @@ HLSearch（素数シフト探索）の Rust 実装です。指定した深さま
 - **並列 DFS（Rayon）**: 利用可能な CPU 数に応じて先頭の複数階層を自動分割し、マルチコア CPU を活用。
 - **割り当てを抑えたビット演算**: 深さごとの作業バッファを再利用し、AND 演算と popcount を1回の走査で実行。
 - **最大値・target による枝刈り**: 累積 popcount が既知の `max_count` と `target` の両方を下回った枝を打ち切り、最大値または target に到達し得る枝だけを探索。
-- **限定された降順探索**: 各素数 $p$ のシフト候補を $\lfloor p / 2 \rfloor$ から $p - 1$ に限定し、降順で探索。
+- **降順探索**: 各素数のシフト候補を降順（$p-1 \dots 0$）に探索。
 - **リアルタイム進捗表示**: ワーカごとのローカル計数を定期集約し、`indicatif` で探索ノード数・処理速度・最良 popcount を表示。
 - **チェックポイント再開**: 逐次モードでは 10,000 ノードごとに進捗をログ出力し、指定したチェックポイントから探索を再開可能。
 
@@ -22,16 +22,6 @@ cargo build --release
 ```
 
 バイナリは `target/release/hlsearch`（Windows では `target/release/hlsearch.exe`）に出力されます。
-
-### CUDA バックエンド
-
-CUDA モードはオプション機能です。CUDA Toolkit 11.8 と NVIDIA ドライバを使用できる環境では、次のようにビルド・実行します。
-
-```bash
-cargo run --release --features cuda -- --mode cuda --depth 8 --cuda-batch-size 8192
-```
-
-通常の `cargo build` / `cargo test` は CUDA SDK を必要としません。CUDA モードを CUDA 機能なしで指定した場合は、再ビルド方法を含むエラーを返します。
 
 ### Windows 用バッチファイル
 
@@ -54,7 +44,7 @@ cargo test sequential_and_parallel_search_find_maximum_results
 cargo fmt -- --check
 
 # Clippy
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --all-targets -- -D warnings
 ```
 
 ## ソース構成
@@ -115,8 +105,6 @@ cargo run --release -- --depth 10 --max-depth 10 --target 400 -o result.json
 > **Note**: 並列モード時のスレッド数は Rayon の既定値（論理コア数）となります。環境変数 `RAYON_NUM_THREADS` でスレッド数を指定可能です。
 > タスク数は既定でスレッド数の4倍です。枝ごとの探索量に偏りがある場合は、`--parallel-tasks-per-thread` を増やして負荷分散を調整できます。
 
-CUDA の bounded バッチ探索は、候補パスを降順に固定サイズのチャンクへ分けます。各チャンクでは GPU が全レベルの補集合マスクの AND と popcount を実行し、CPU は返却された popcount から最大値・最大値パス・target パスを記録します。既定の `--cuda-batch-size 8192` は GPU メモリ使用量と転送回数のバランスを取った値です。
-
 ### 入力値の検証
 
 実行開始前に次の条件を検証します。条件に違反した場合はエラーを表示して終了します。
@@ -137,7 +125,7 @@ CUDA の bounded バッチ探索は、候補パスを降順に固定サイズの
 3. **深さ優先探索 (DFS)**:
    - マスクを AND 演算しながら非再帰（スタック）DFS を行います。
    - 途中の累積 popcount が既知の `max_count` と `target` の両方を下回った枝は即座に枝刈り（pruning）します。
-   - 各素数 $p$ では、シフト候補 $\lfloor p / 2 \rfloor \dots p - 1$ を降順で探索します。
+   - 各素数のシフト探索は降順（$p-1 \dots 0$）に進めます。
 4. **葉ノード（深さ `depth`）の判定**:
    - popcount がこれまでの最大値を超えた場合、`max_count` と記録済みパスを更新します。
    - `depth == max-depth` かつ popcount が `target` と一致した場合、そのパスを `target_shifts` に記録します。
@@ -146,7 +134,6 @@ CUDA の bounded バッチ探索は、候補パスを降順に固定サイズの
 
 - `--mode parallel`（デフォルト）: Rayon のワーカ数に応じて先頭の複数階層を分割し、複数スレッドで並列 DFS します。各階層のシフト候補は降順で処理されます。
 - `--mode sequential`: 単一スレッドで決定論的に非再帰 DFS を実行します。
-- `--mode cuda`: CUDA GPU 上で bounded バッチごとに全候補の AND / popcount を実行します。CUDA feature を有効にしてビルドする必要があります。
 
 並列モードではスレッドの実行順序により、記録される最大値パスおよび target パスの順序が逐次モードと異なる場合があります。
 
@@ -155,12 +142,11 @@ CUDA の bounded バッチ探索は、候補パスを降順に固定サイズの
 | フラグ | 短縮 | 既定値 | 説明 |
 | --- | --- | --- | --- |
 | `--depth` | `-d` | `8` | 探索する階層数（使用する素数の個数） |
-| `--mode` | `-m` | `parallel` | 探索モード（`parallel`、`sequential`、または `cuda`） |
+| `--mode` | `-m` | `parallel` | 探索モード（`parallel` または `sequential`） |
 | `--cols` | | `3159` | ビット列の長さ |
 | `--output` | `-o` | `shift_path.json` | JSON出力ファイルパス（実行時にタイムスタンプが挿入されます） |
 | `--checkpoint-interval` | | `100000` | チェックポイント保存周期 (ノード数) |
 | `--parallel-tasks-per-thread` | | `4` | 並列時のスレッド当たりタスク数 |
-| `--cuda-batch-size` | | `8192` | CUDA bounded バッチの候補パス数 |
 | `--max-depth` | | `249` | target 判定を行う探索深さ |
 | `--target` | `-t` | `447` | `max-depth` 時に記録対象とする popcount |
 

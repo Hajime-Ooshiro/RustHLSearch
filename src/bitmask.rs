@@ -42,11 +42,6 @@ impl BitMask {
         self.size
     }
 
-    #[cfg(feature = "cuda")]
-    pub(crate) fn words(&self) -> &[u64] {
-        &self.data
-    }
-
     /// 指定したインデックスのビットをセット
     #[inline]
     pub fn set(&mut self, idx: usize, val: bool) {

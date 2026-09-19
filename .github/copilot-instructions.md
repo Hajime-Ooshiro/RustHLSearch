@@ -46,7 +46,7 @@ cargo test test_name
 cargo fmt -- --check
 
 # Run Clippy's default checks
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --all-targets -- -D warnings
 ```
 
 The README is the source of truth for user-facing CLI defaults and examples.

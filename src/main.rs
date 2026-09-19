@@ -46,7 +46,7 @@ struct OutputResult<'a> {
 #[derive(Parser, Debug)]
 #[command(author, version, about = "HLSearch: 素数シフト探索プログラム (Rust版)", long_about = None)]
 pub struct Cli {
-    #[arg(short, long, default_value_t = 8, help = "探索する階層数")]
+    #[arg(short, long, default_value_t = 249, help = "探索する階層数")]
     pub depth: usize,
 
     #[arg(

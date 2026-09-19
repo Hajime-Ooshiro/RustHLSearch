@@ -143,7 +143,6 @@ struct WorkItem {
 
 pub struct State {
     pub primes: Vec<usize>,
-    pub params: Vec<Vec<usize>>,
     pub max_depth: usize,
     pub target: usize,
     pub key: Vec<usize>,
@@ -195,14 +194,8 @@ impl State {
             }
         }
 
-        let params = primes
-            .iter()
-            .map(|&prime| (prime / 2..prime).collect())
-            .collect();
-
         let state = State {
             primes,
-            params,
             max_depth: 249,
             target: 447,
             key: Vec::new(),
@@ -217,7 +210,6 @@ impl State {
             parallel_tasks_per_thread: 4,
             shift_table,
         };
-        debug_assert_eq!(state.params.len(), state.primes.len());
         Ok(state)
     }
 
@@ -728,18 +720,6 @@ mod tests {
         let table = build_shift_table(&[2], 4);
         let state = State::new(vec![2], 4, table).unwrap();
         assert_eq!(state.checkpoint_interval, 100_000);
-    }
-
-    #[test]
-    fn params_contain_ranges_from_half_to_one_before_each_prime() {
-        let primes = vec![2, 3, 5, 7];
-        let table = build_shift_table(&primes, 8);
-        let state = State::new(primes, 8, table).unwrap();
-
-        assert_eq!(
-            state.params,
-            vec![vec![1], vec![1, 2], vec![2, 3, 4], vec![3, 4, 5, 6]]
-        );
     }
 
     #[test]

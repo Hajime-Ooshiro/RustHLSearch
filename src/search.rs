@@ -138,6 +138,7 @@ impl SharedResults {
 struct WorkItem {
     key: Vec<usize>,
     base_mask: BitMask,
+    count: usize,
 }
 
 pub struct State {
@@ -255,13 +256,15 @@ impl State {
 
             self.rebuild_stack_and_masks(&checkpoint.stack)?
         } else {
+            self.max_count = self.max_count.max(self.greedy_max_count(depth));
             vec![Frame {
                 level: 0,
                 next_idx: self.primes[0],
             }]
         };
-        let mut masks = self.rebuild_masks(depth);
+        let (mut masks, mut counts) = self.rebuild_masks(depth);
         let mut checkpoint_due = false;
+        let records_target = depth == self.max_depth;
 
         while !stack.is_empty() {
             if checkpoint_due {
@@ -286,8 +289,23 @@ impl State {
             self.node_count += 1;
 
             let (base_masks, node_masks) = masks.split_at_mut(level + 1);
-            let count =
-                node_masks[0].bitand_into_count(&base_masks[level], &self.shift_table[level][i]);
+            let min_count = keep_threshold(self.max_count, self.target, records_target);
+            let Some(count) = node_masks[0].bitand_into_count_bounded(
+                &base_masks[level],
+                &self.shift_table[level][i],
+                counts[level],
+                min_count,
+            ) else {
+                self.key.pop();
+                continue;
+            };
+            counts[level + 1] = count;
+            debug_assert!(!should_prune(
+                count,
+                self.max_count,
+                self.target,
+                records_target
+            ));
 
             if self.node_count.is_multiple_of(self.checkpoint_interval) {
                 pb.set_position(self.node_count);
@@ -298,16 +316,6 @@ impl State {
                     self.key.len()
                 ));
                 checkpoint_due = true;
-            }
-
-            if count + (depth - level) < self.max_count {
-                self.key.pop();
-                continue;
-            }
-
-            if should_prune(count, self.max_count, self.target, depth == self.max_depth) {
-                self.key.pop();
-                continue;
             }
 
             if level + 1 >= depth {
@@ -402,39 +410,67 @@ impl State {
         Ok(stack)
     }
 
-    fn rebuild_masks(&self, depth: usize) -> Vec<BitMask> {
+    fn rebuild_masks(&self, depth: usize) -> (Vec<BitMask>, Vec<usize>) {
         let mut masks = vec![self.zero_mask.clone(); depth + 1];
+        let mut counts = vec![0; depth + 1];
+        counts[0] = self.zero_mask.count_ones();
         for (level, &shift_idx) in self.key.iter().enumerate() {
             let (base_masks, node_masks) = masks.split_at_mut(level + 1);
-            node_masks[0]
+            counts[level + 1] = node_masks[0]
                 .bitand_into_count(&base_masks[level], &self.shift_table[level][shift_idx]);
         }
-        masks
+        (masks, counts)
+    }
+
+    fn greedy_max_count(&self, depth: usize) -> usize {
+        let mut current = self.zero_mask.clone();
+        let mut scratch = self.zero_mask.clone();
+        let mut best_count = current.count_ones();
+        for level in 0..depth {
+            let mut level_best = 0;
+            let mut level_shift = 0;
+            for shift in 0..self.primes[level] {
+                let count = scratch.bitand_into_count(&current, &self.shift_table[level][shift]);
+                if count >= level_best {
+                    level_best = count;
+                    level_shift = shift;
+                }
+            }
+            scratch.bitand_into_count(&current, &self.shift_table[level][level_shift]);
+            std::mem::swap(&mut current, &mut scratch);
+            best_count = level_best;
+        }
+        best_count
     }
 
     pub fn search_parallel(&self, depth: usize) -> SharedResults {
+        let seed_max = self.greedy_max_count(depth);
         let results = Arc::new(ParallelResults {
-            max_count: AtomicUsize::new(0),
+            max_count: AtomicUsize::new(seed_max),
             results: Mutex::new(SharedResults::default()),
         });
         let node_count = Arc::new(AtomicU64::new(0));
         let pb = progress_bar();
+        let records_target = depth == self.max_depth;
 
         let target_tasks =
             rayon::current_num_threads().saturating_mul(self.parallel_tasks_per_thread);
         let split_depth = self.parallel_split_depth(depth, target_tasks);
-        let work_items = self.parallel_work_items(split_depth);
+        let mut work_items = self.parallel_work_items(split_depth);
+        work_items.sort_unstable_by(|left, right| right.count.cmp(&left.count));
         work_items.into_par_iter().for_each(|work_item| {
             let mut key = work_item.key;
             let mut masks = vec![self.zero_mask.clone(); depth + 1];
+            let mut counts = vec![0; depth + 1];
             masks[split_depth] = work_item.base_mask;
-            let count = masks[split_depth].count_ones();
+            let count = work_item.count;
+            counts[split_depth] = count;
             let mut local = SharedResults::default();
             if split_depth == depth {
                 if results.observe_best(count) {
                     local.record_best(count, &key);
                 }
-                if depth == self.max_depth && count == self.target {
+                if records_target && count == self.target {
                     local.target_results = 1;
                     local.target_shifts.push(key);
                 }
@@ -442,12 +478,12 @@ impl State {
                 return;
             }
 
-            if should_prune(
-                count,
+            let min_count = keep_threshold(
                 results.max_count.load(Ordering::Relaxed),
                 self.target,
-                depth == self.max_depth,
-            ) {
+                records_target,
+            );
+            if count < min_count {
                 results.merge(local);
                 return;
             }
@@ -472,8 +508,27 @@ impl State {
                 key.push(idx);
                 local_nodes += 1;
                 let (base_masks, node_masks) = masks.split_at_mut(level + 1);
-                let c_count = node_masks[0]
-                    .bitand_into_count(&base_masks[level], &self.shift_table[level][idx]);
+                let min_count = keep_threshold(
+                    results.max_count.load(Ordering::Relaxed),
+                    self.target,
+                    records_target,
+                );
+                let Some(c_count) = node_masks[0].bitand_into_count_bounded(
+                    &base_masks[level],
+                    &self.shift_table[level][idx],
+                    counts[level],
+                    min_count,
+                ) else {
+                    key.pop();
+                    continue;
+                };
+                counts[level + 1] = c_count;
+                debug_assert!(!should_prune(
+                    c_count,
+                    results.max_count.load(Ordering::Relaxed),
+                    self.target,
+                    records_target
+                ));
 
                 if local_nodes == self.checkpoint_interval {
                     let n = node_count.fetch_add(local_nodes, Ordering::Relaxed) + local_nodes;
@@ -488,26 +543,11 @@ impl State {
                     ));
                 }
 
-                if c_count + (depth - level) < results.max_count.load(Ordering::Relaxed){
-                    key.pop();
-                    continue;
-                }
-
-                if should_prune(
-                    c_count,
-                    results.max_count.load(Ordering::Relaxed),
-                    self.target,
-                    depth == self.max_depth,
-                ) {
-                    key.pop();
-                    continue;
-                }
-
                 if level + 1 >= depth {
                     if results.observe_best(c_count) {
                         local.record_best(c_count, &key);
                     }
-                    if depth == self.max_depth && c_count == self.target {
+                    if records_target && c_count == self.target {
                         local.target_results += 1;
                         local.target_shifts.push(key.clone());
                     }
@@ -543,6 +583,7 @@ impl State {
         let mut work_items = vec![WorkItem {
             key: Vec::with_capacity(split_depth),
             base_mask: self.zero_mask.clone(),
+            count: self.zero_mask.count_ones(),
         }];
 
         for level in 0..split_depth {
@@ -550,10 +591,15 @@ impl State {
             for item in work_items {
                 for shift in (0..self.primes[level]).rev() {
                     let mut base_mask = self.zero_mask.clone();
-                    base_mask.bitand_into_count(&item.base_mask, &self.shift_table[level][shift]);
+                    let count = base_mask
+                        .bitand_into_count(&item.base_mask, &self.shift_table[level][shift]);
                     let mut key = item.key.clone();
                     key.push(shift);
-                    next_items.push(WorkItem { key, base_mask });
+                    next_items.push(WorkItem {
+                        key,
+                        base_mask,
+                        count,
+                    });
                 }
             }
             work_items = next_items;
@@ -564,8 +610,17 @@ impl State {
 }
 
 #[inline]
+fn keep_threshold(max_count: usize, target: usize, records_target: bool) -> usize {
+    if records_target {
+        max_count.min(target)
+    } else {
+        max_count
+    }
+}
+
+#[inline]
 fn should_prune(count: usize, max_count: usize, target: usize, records_target: bool) -> bool {
-    count < max_count && (!records_target || count < target)
+    count < keep_threshold(max_count, target, records_target)
 }
 
 fn progress_bar() -> ProgressBar {
@@ -794,7 +849,19 @@ mod tests {
         assert_eq!(rebuilt.len(), 1);
         assert_eq!(rebuilt[0].level, 2);
 
-        let masks = state.rebuild_masks(3);
+        let (masks, counts) = state.rebuild_masks(3);
         assert_eq!(masks[3].count_ones(), 2);
+        assert_eq!(counts[3], 2);
+    }
+
+    #[test]
+    fn greedy_max_count_matches_full_search() {
+        let primes = vec![2, 3];
+        let cols = 4;
+        let table = build_shift_table(&primes, cols);
+        let mut sequential = State::new(primes.clone(), cols, table.clone()).unwrap();
+        sequential.search_with_checkpoint(2, None, None).unwrap();
+        let greedy = State::new(primes, cols, table).unwrap().greedy_max_count(2);
+        assert_eq!(greedy, sequential.max_count);
     }
 }

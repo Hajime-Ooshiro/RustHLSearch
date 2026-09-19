@@ -32,6 +32,42 @@ impl BitMask {
             .sum()
     }
 
+    /// `lhs & rhs` を格納し popcount を返す。
+    /// 残りの `lhs` ビットを足しても `min_count` に届かない場合は `None`。
+    #[inline]
+    pub fn bitand_into_count_bounded(
+        &mut self,
+        lhs: &Self,
+        rhs: &Self,
+        lhs_count: usize,
+        min_count: usize,
+    ) -> Option<usize> {
+        debug_assert_eq!(self.data.len(), lhs.data.len());
+        debug_assert_eq!(self.data.len(), rhs.data.len());
+
+        if min_count == 0 {
+            return Some(self.bitand_into_count(lhs, rhs));
+        }
+
+        let mut count = 0usize;
+        let mut remaining_lhs = lhs_count;
+        for ((out, &left), &right) in self
+            .data
+            .iter_mut()
+            .zip(lhs.data.iter())
+            .zip(rhs.data.iter())
+        {
+            remaining_lhs = remaining_lhs.saturating_sub(left.count_ones() as usize);
+            let value = left & right;
+            *out = value;
+            count += value.count_ones() as usize;
+            if count + remaining_lhs < min_count {
+                return None;
+            }
+        }
+        Some(count)
+    }
+
     /// 1 (true) のビット数をカウント (popcount)
     #[inline]
     pub fn count_ones(&self) -> usize {
@@ -110,5 +146,36 @@ mod tests {
         assert_eq!(output.bitand_into_count(&left, &right), 63);
         assert_eq!(output.count_ones(), 63);
         assert_eq!(output.size(), 65);
+    }
+
+    #[test]
+    fn bitand_into_count_bounded_matches_full_and_when_reachable() {
+        let mut left = BitMask::new_ones(65);
+        let mut right = BitMask::new_ones(65);
+        left.set(1, false);
+        right.set(0, false);
+        let lhs_count = left.count_ones();
+        let mut output = BitMask::new_ones(65);
+
+        assert_eq!(
+            output.bitand_into_count_bounded(&left, &right, lhs_count, 63),
+            Some(63)
+        );
+        assert_eq!(output.count_ones(), 63);
+    }
+
+    #[test]
+    fn bitand_into_count_bounded_aborts_when_upper_bound_is_too_low() {
+        let mut left = BitMask::new_ones(65);
+        let mut right = BitMask::new_ones(65);
+        left.set(1, false);
+        right.set(0, false);
+        let lhs_count = left.count_ones();
+        let mut output = BitMask::new_ones(65);
+
+        assert_eq!(
+            output.bitand_into_count_bounded(&left, &right, lhs_count, 64),
+            None
+        );
     }
 }

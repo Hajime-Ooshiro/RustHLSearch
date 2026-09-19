@@ -1,17 +1,20 @@
 # RustHLSearch
 
-HLSearch（素数シフト探索）の Rust 実装です。指定した深さまでの素数シフト列を深さ優先探索（DFS）し、葉のビット数（popcount）の最大値と、その最大値に一致する全パスを記録します。`depth` が `max-depth` に一致する場合は、`target` に一致するパスも別途すべて記録します。途中の popcount が既知の最大値と target の両方を下回った枝は打ち切ります。
+HLSearch（素数シフト探索）の Rust 実装です。指定した深さまでの素数シフト列を深さ優先探索（DFS）し、葉のビット数（popcount）の最大値と、その最大値に一致する全パスを記録します。`depth` が `max-depth` に一致する場合は、`target` に一致するパスも別途すべて記録します。AND は popcount を増やさないため、現在の popcount が既知の最大値と target の両方を下回った枝は打ち切ります。
 
 ## 機能・特徴
 
-- **高速なビット並列処理**: 64-bit 単位の独自 `BitMask` 構造体による高速 bitwise AND および popcount。
+- **高速なビット並列処理**: 64-bit 単位の独自 `BitMask` 構造体による bitwise AND および popcount。
 - **効率的なシフト表構築**: 補集合マスクのゼロビット位置だけを設定し、不要な全列走査を回避。
 - **並列 DFS（Rayon）**: 利用可能な CPU 数に応じて先頭の複数階層を自動分割し、マルチコア CPU を活用。
 - **割り当てを抑えたビット演算**: 深さごとの作業バッファを再利用し、AND 演算と popcount を1回の走査で実行。
-- **最大値・target による枝刈り**: 累積 popcount が既知の `max_count` と `target` の両方を下回った枝を打ち切り、最大値または target に到達し得る枝だけを探索。
+- **AND 途中打ち切り**: 親マスクの残り 1 ビットを上界とし、`max_count` / `target` に届かないと分かった時点で残りのワード計算を省略。
+- **popcount 上界による枝刈り**: 部分木の popcount は現在値を超えられない。既知の `max_count` と `target` の両方を下回った枝だけを打ち切る。
+- **貪欲シード**: 探索開始前に各階層で popcount 最大のシフトを選ぶパスで `max_count` を初期化し、初期の枝刈りを強める。チェックポイント再開時は探索順を保つためスキップする。
+- **良い枝の優先（並列）**: 先頭階層の仕事単位を残ビット数の多い順に並べてから実行する。
 - **降順探索**: 各素数のシフト候補を降順（$p-1 \dots 0$）に探索。
 - **リアルタイム進捗表示**: ワーカごとのローカル計数を定期集約し、`indicatif` で探索ノード数・処理速度・最良 popcount を表示。
-- **チェックポイント再開**: 逐次モードでは 10,000 ノードごとに進捗をログ出力し、指定したチェックポイントから探索を再開可能。
+- **チェックポイント再開**: 逐次モードでは 100,000 ノードごとに進捗を更新し、`checkpoint.json` へ保存・再開可能。
 
 ## ビルド
 
@@ -86,7 +89,7 @@ cargo run --release -- --mode sequential --depth 249 --max-depth 249 --target 44
 cargo run --release -- --mode sequential
 ```
 
-逐次モードでは 100,000 ノードごとに `探索経過` をログへ出力し、DFS のスタックと集計値を `checkpoint.json` に自動保存します。起動時に `checkpoint.json` が存在すれば自動的に読み込んで続行し、探索が正常終了すると `searched_YYYYMMDD_HHMMSS.json` に改名します。チェックポイント機能は探索順序を保てる逐次モード専用です。
+逐次モードでは 100,000 ノードごとに進捗を更新し、DFS のスタックと集計値を `checkpoint.json` に自動保存します。起動時に `checkpoint.json` が存在すれば自動的に読み込んで続行し、探索が正常終了すると `searched_YYYYMMDD_HHMMSS.json` に改名します。チェックポイント機能は探索順序を保てる逐次モード専用です。並列モード起動時に `checkpoint.json` があるとエラーになります。
 
 チェックポイント保存周期を変更する場合:
 
@@ -112,6 +115,8 @@ cargo run --release -- --depth 10 --max-depth 10 --target 400 -o result.json
 - `depth` は 1 以上
 - `cols` は 1 以上
 - `target` は `cols` 以下
+- `checkpoint-interval` は 1 以上
+- `parallel-tasks-per-thread` は 1 以上
 - `depth` は使用する素数数以下
 
 さらに `State` の生成時には、探索対象の素数列が空でないこと、列数が 1 以上であること、シフト表の階層数・各階層のシフト数・各マスクの列数が素数列および `cols` と一致することを検証します。不整合な探索設定は探索開始前にエラーとして拒否されます。
@@ -122,17 +127,20 @@ cargo run --release -- --depth 10 --max-depth 10 --target 400 -o result.json
    - 1579 以下の素数（最大 249 個）をエラトステネスの篩で生成し、先頭から `depth` 個を探索階層に使用します。
 2. **補集合シフトテーブル作成**:
    - 各素数 $p$ とシフト $k \in [0, p)$ について、長さ `cols` の補集合ビットマスクを事前構築します。
-3. **深さ優先探索 (DFS)**:
+3. **貪欲シード**（新規探索時）:
+   - 各階層で残 popcount が最大になるシフトを選び、その葉の popcount で `max_count` を初期化します。
+4. **深さ優先探索 (DFS)**:
    - マスクを AND 演算しながら非再帰（スタック）DFS を行います。
-   - 途中の累積 popcount が既知の `max_count` と `target` の両方を下回った枝は即座に枝刈り（pruning）します。
+   - AND 中に、親マスクの未処理ビットを足しても記録閾値に届かない場合はその場で打ち切ります。
+   - ノードの popcount は子孫の上界です。`count < max_count` かつ（target を記録しない、または `count < target`）なら枝を捨てます。
    - 各素数のシフト探索は降順（$p-1 \dots 0$）に進めます。
-4. **葉ノード（深さ `depth`）の判定**:
+5. **葉ノード（深さ `depth`）の判定**:
    - popcount がこれまでの最大値を超えた場合、`max_count` と記録済みパスを更新します。
    - `depth == max-depth` かつ popcount が `target` と一致した場合、そのパスを `target_shifts` に記録します。
 
 ### 探索モード
 
-- `--mode parallel`（デフォルト）: Rayon のワーカ数に応じて先頭の複数階層を分割し、複数スレッドで並列 DFS します。各階層のシフト候補は降順で処理されます。
+- `--mode parallel`（デフォルト）: Rayon のワーカ数に応じて先頭の複数階層を分割し、残ビット数の多い仕事から並列 DFS します。各階層のシフト候補は降順で処理されます。
 - `--mode sequential`: 単一スレッドで決定論的に非再帰 DFS を実行します。
 
 並列モードではスレッドの実行順序により、記録される最大値パスおよび target パスの順序が逐次モードと異なる場合があります。
@@ -164,6 +172,7 @@ cargo run --release -- --depth 10 --max-depth 10 --target 400 -o result.json
     "max_depth": 249,
     "target": 447,
     "cols": 3159,
+    "parallel_tasks_per_thread": 4,
     "elapsed": "1.234567s"
   },
   "result": {

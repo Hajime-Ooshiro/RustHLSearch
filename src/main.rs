@@ -25,11 +25,8 @@ struct OutputFile<'a> {
 struct OutputConfig<'a> {
     mode: &'a str,
     depth: usize,
-    limit: usize,
     max_depth: usize,
-    target: usize,
     cols: usize,
-    primes_count: &'a str,
     elapsed: String,
 }
 
@@ -55,20 +52,11 @@ pub struct Cli {
     )]
     pub mode: SearchMode,
 
-    #[arg(short, long, default_value_t = 447, help = "枝刈り下限値")]
-    pub limit: usize,
-
     #[arg(long, default_value_t = 249, help = "打ち切り判定用 max-depth")]
     pub max_depth: usize,
 
-    #[arg(short, long, default_value_t = 447, help = "打ち切り目標値")]
-    pub target: usize,
-
     #[arg(long, default_value_t = 3159, help = "列数 (長さ)")]
     pub cols: usize,
-
-    #[arg(long, help = "使用する素数の個数制限")]
-    pub primes_count: Option<usize>,
 
     #[arg(
         short,
@@ -87,29 +75,7 @@ impl Cli {
         if self.cols == 0 {
             return Err("cols must be at least 1".to_string());
         }
-        if self.limit > self.cols {
-            return Err(format!(
-                "limit ({}) cannot exceed cols ({})",
-                self.limit, self.cols
-            ));
-        }
-        if let Some(primes_count) = self.primes_count {
-            if primes_count == 0 {
-                return Err("primes-count must be at least 1".to_string());
-            }
-            if primes_count > available_primes {
-                return Err(format!(
-                    "primes-count ({}) cannot exceed available primes ({})",
-                    primes_count, available_primes
-                ));
-            }
-            if self.depth > primes_count {
-                return Err(format!(
-                    "depth ({}) cannot exceed primes-count ({})",
-                    self.depth, primes_count
-                ));
-            }
-        } else if self.depth > available_primes {
+        if self.depth > available_primes {
             return Err(format!(
                 "depth ({}) cannot exceed available primes ({})",
                 self.depth, available_primes
@@ -129,27 +95,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    let primes = match cli.primes_count {
-        Some(cnt) => all_primes[..cnt].to_vec(),
-        None => all_primes,
-    };
+    let primes = all_primes;
 
     info!("HLSearch (Rust) 開始");
     info!(
-        "設定: mode={:?} depth={} limit={} max_depth={} target={} primes_count={}",
+        "設定: mode={:?} depth={} max_depth={}",
         cli.mode,
         cli.depth,
-        cli.limit,
-        cli.max_depth,
-        cli.target,
-        primes.len()
+        cli.max_depth
     );
 
     let start_time = Instant::now();
     let shift_table = build_shift_table(&primes[..cli.depth], cli.cols);
-    let mut state = State::new(primes, cli.limit, cli.cols, shift_table);
+    let mut state = State::new(primes, cli.cols, shift_table);
     state.max_depth = cli.max_depth;
-    state.target = cli.target;
 
     match cli.mode {
         SearchMode::Sequential => state.search(cli.depth),
@@ -174,10 +133,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut writer = BufWriter::new(file);
     info!("出力ファイル: {}", output_path.display());
 
-    let primes_count = cli
-        .primes_count
-        .map(|count| count.to_string())
-        .unwrap_or_else(|| "all".to_string());
     let output = OutputFile {
         config: OutputConfig {
             mode: match cli.mode {
@@ -185,11 +140,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 SearchMode::Parallel => "parallel",
             },
             depth: cli.depth,
-            limit: cli.limit,
             max_depth: cli.max_depth,
-            target: cli.target,
             cols: cli.cols,
-            primes_count: &primes_count,
             elapsed: format!("{elapsed:?}"),
         },
         result: OutputResult {
@@ -213,11 +165,8 @@ mod tests {
         Cli {
             depth: 1,
             mode: SearchMode::Sequential,
-            limit: 1,
             max_depth: 249,
-            target: 447,
             cols: 4,
-            primes_count: None,
             output: PathBuf::from("shift_path.txt"),
         }
     }
@@ -234,12 +183,6 @@ mod tests {
         assert!(cli.validate(3).is_err());
         cli = test_cli();
         cli.cols = 0;
-        assert!(cli.validate(3).is_err());
-        cli = test_cli();
-        cli.limit = 5;
-        assert!(cli.validate(3).is_err());
-        cli = test_cli();
-        cli.primes_count = Some(4);
         assert!(cli.validate(3).is_err());
     }
 }

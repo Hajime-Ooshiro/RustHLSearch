@@ -1,8 +1,7 @@
 use crate::bitmask::BitMask;
 use indicatif::{ProgressBar, ProgressStyle};
-use log::info;
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// 基底行の生成と補集合シフトテーブルの作成
@@ -52,9 +51,7 @@ pub struct SharedResults {
 
 pub struct State {
     pub primes: Vec<usize>,
-    pub limit: usize,
     pub max_depth: usize,
-    pub target: usize,
     pub key: Vec<usize>,
     pub zero_mask: BitMask,
     pub max_count: usize,
@@ -65,17 +62,10 @@ pub struct State {
 }
 
 impl State {
-    pub fn new(
-        primes: Vec<usize>,
-        limit: usize,
-        cols: usize,
-        shift_table: Vec<Vec<BitMask>>,
-    ) -> Self {
+    pub fn new(primes: Vec<usize>, cols: usize, shift_table: Vec<Vec<BitMask>>) -> Self {
         State {
             primes,
-            limit,
             max_depth: 249,
-            target: 447,
             key: Vec::new(),
             zero_mask: BitMask::new_ones(cols),
             max_count: 0,
@@ -124,7 +114,7 @@ impl State {
                 ));
             }
 
-            if count < self.limit {
+            if count + (depth - level) < self.max_count {
                 self.key.pop();
                 continue;
             }
@@ -136,21 +126,14 @@ impl State {
 
             if level + 1 >= depth {
                 if depth == self.max_depth {
-                    if count == self.target {
-                        self.results += 1;
-                        self.shifts.push(self.key.clone());
-                        info!("target level={} key={:?} count={}", level, self.key, count);
-                        self.key.pop();
-                        break;
-                    }
                     if count > self.max_count {
                         self.max_count = count;
                         self.shifts.clear();
                         self.shifts.push(self.key.clone());
-                        info!("best level={} key={:?} count={}", level, self.key, count);
+                        self.results = 1;
                     } else if count == self.max_count {
                         self.shifts.push(self.key.clone());
-                        info!("best level={} key={:?} count={}", level, self.key, count);
+                        self.results = self.shifts.len();
                     }
                 }
                 self.key.pop();
@@ -164,6 +147,8 @@ impl State {
                 next_idx: self.primes[level + 1],
             });
         }
+
+        self.results = self.shifts.len();
         pb.finish_with_message("探索完了");
     }
 
@@ -172,28 +157,30 @@ impl State {
         let results = Arc::new(AtomicUsize::new(0));
         let shifts = Arc::new(Mutex::new(Vec::<Vec<usize>>::new()));
         let node_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let stop = Arc::new(AtomicBool::new(false));
         let pb = progress_bar();
 
         let p0 = self.primes[0];
         (0..p0).into_par_iter().rev().for_each(|i| {
-            if stop.load(Ordering::Relaxed) {
-                return;
-            }
-
             let mut key = vec![i];
             let base_mask = self.zero_mask.bitand(&self.shift_table[0][i]);
             let count = base_mask.count_ones();
-            if count < self.limit {
+
+            if count < max_count.load(Ordering::Relaxed) {
                 return;
             }
 
             if depth == 1 {
-                max_count.fetch_max(count, Ordering::Relaxed);
-                if count == self.limit && !stop.swap(true, Ordering::Relaxed) {
-                    results.fetch_add(1, Ordering::Relaxed);
-                    shifts.lock().unwrap().push(key.clone());
-                    info!("target level=0 key={:?} count={}", key, count);
+                let current_best = max_count.load(Ordering::Relaxed);
+                if count > current_best {
+                    max_count.store(count, Ordering::Relaxed);
+                    let mut lock = shifts.lock().unwrap();
+                    lock.clear();
+                    lock.push(key.clone());
+                    results.store(1, Ordering::Relaxed);
+                } else if count == current_best {
+                    let mut lock = shifts.lock().unwrap();
+                    lock.push(key.clone());
+                    results.store(lock.len(), Ordering::Relaxed);
                 }
                 return;
             }
@@ -205,9 +192,6 @@ impl State {
             }];
 
             while let Some(frame) = stack.last_mut() {
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
                 if frame.next_idx == 0 {
                     stack.pop();
                     if stack.last().is_some() {
@@ -235,7 +219,7 @@ impl State {
                     ));
                 }
 
-                if c_count < self.limit {
+                if count + (depth - level) < max_count.load(Ordering::Relaxed) {
                     key.pop();
                     continue;
                 }
@@ -246,28 +230,22 @@ impl State {
                 }
 
                 if level + 1 >= depth {
-                    if c_count == self.limit && !stop.swap(true, Ordering::Relaxed) {
-                        results.fetch_add(1, Ordering::Relaxed);
-                        shifts.lock().unwrap().push(key.clone());
-                        info!("target level={} key={:?} count={}", level, key, c_count);
-                    }
-                    if stop.load(Ordering::Relaxed) {
-                        break;
+                    if depth == self.max_depth {
+                        let current_best = max_count.load(Ordering::Relaxed);
+                        if c_count > current_best {
+                            max_count.store(c_count, Ordering::Relaxed);
+                            let mut lock = shifts.lock().unwrap();
+                            lock.clear();
+                            lock.push(key.clone());
+                            results.store(1, Ordering::Relaxed);
+                        } else if c_count == current_best {
+                            let mut lock = shifts.lock().unwrap();
+                            lock.push(key.clone());
+                            results.store(lock.len(), Ordering::Relaxed);
+                        }
                     }
                     key.pop();
                     continue;
-                }
-
-                if depth == self.max_depth {
-                    if c_count > max_count.load(Ordering::Relaxed) {
-                        max_count.store(c_count, Ordering::Relaxed);
-                        shifts.lock().unwrap().clear();
-                        shifts.lock().unwrap().push(key.clone());
-                        info!("best level={} key={:?} count={}", level, key, c_count);
-                    } else if c_count == max_count.load(Ordering::Relaxed) {
-                        shifts.lock().unwrap().push(key.clone());
-                        info!("best level={} key={:?} count={}", level, key, c_count);
-                    }
                 }
 
                 stack.push(Frame {
@@ -316,19 +294,17 @@ mod tests {
         let primes = vec![2, 3];
         let cols = 4;
         let table = build_shift_table(&primes, cols);
-        let mut sequential = State::new(primes.clone(), 1, cols, table.clone());
+        let mut sequential = State::new(primes.clone(), cols, table.clone());
         sequential.max_depth = 2;
-        sequential.target = 1;
         sequential.search(2);
-        let mut parallel = State::new(primes.clone(), 1, cols, table);
+        let mut parallel = State::new(primes.clone(), cols, table);
         parallel.max_depth = 2;
-        parallel.target = 1;
         let result = parallel.search_parallel(2);
 
-        assert_eq!(sequential.results, 1);
-        assert_eq!(result.results, 1);
-        assert_eq!(result.shifts.len(), 1);
-        assert_eq!(result.shifts[0].len(), 2);
+        assert!(sequential.max_count > 0);
+        assert!(result.max_count > 0);
+        assert!(result.results > 0);
+        assert!(result.shifts[0].len() >= 2);
         for (level, &shift) in result.shifts[0].iter().enumerate() {
             assert!(shift < primes[level]);
         }

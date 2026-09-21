@@ -85,7 +85,7 @@ cargo run --release -- --mode sequential --depth 8
 cargo run --release -- --mode sequential
 ```
 
-逐次モードでは 100,000 ノードごとに進捗を更新し、DFS のスタックと集計値を `checkpoint.json` に自動保存します。起動時に `checkpoint.json` が存在すれば自動的に読み込んで続行し、探索が正常終了すると `searched_YYYYMMDD_HHMMSS.json` に改名します。チェックポイント機能は探索順序を保てる逐次モード専用です。並列モード起動時に `checkpoint.json` があるとエラーになります。
+逐次モードでは 100,000 ノードごとに進捗を更新し、DFS のスタックと集計値を `checkpoint.json` に自動保存します。更新前の世代は `checkpoint.bak` に退避されます。起動時に `checkpoint.json` が存在しない場合は `checkpoint.bak` から復旧を試みます。探索が正常終了すると `checkpoint.json` は `searched_YYYYMMDD_HHMMSS.json` に改名され、バックアップも削除されます。チェックポイント機能は探索順序を保てる逐次モード専用です。並列モード起動時に `checkpoint.json` または `checkpoint.bak` があるとエラーになります。
 
 チェックポイント保存周期を変更する場合:
 
@@ -112,7 +112,6 @@ cargo run --release -- --depth 10 --cols 4000 -o result.json
 - `cols` は 1 以上
 - `checkpoint-interval` は 1 以上
 - `depth` は使用する素数数以下
-
 
 ## 探索アルゴリズムの概要
 
@@ -141,12 +140,12 @@ cargo run --release -- --depth 10 --cols 4000 -o result.json
 | `--depth` | `-d` | `8` | 探索する階層数（使用する素数の個数） |
 | `--mode` | `-m` | `parallel` | 探索モード（`parallel` または `sequential`） |
 | `--cols` | | `3159` | ビット列の長さ |
-| `--output` | `-o` | `shift_path.json` | JSON出力ファイルパス（実行時にタイムスタンプが挿入されます） |
+| `--output` | `-o` | `result.json` | 出力先パス（親ディレクトリに結果ファイルを出力） |
 | `--checkpoint-interval` | | `100000` | チェックポイント保存周期 (ノード数) |
 
 ## 出力ファイル形式
 
-出力ファイル名には探索深さと実行時のタイムスタンプが付与されます（例: `shift_path.json` を深さ 8 で実行した場合 `shift_path_depth8_YYYYMMDD_HHMMSS.json`）。
+出力ファイルは、シフトパスを `shift_path_depth8_YYYYMMDD_HHMMSS.txt`、探索結果を `result_depth8_YYYYMMDD_HHMMSS.json` の形式で出力します。シフトパスは 1 行に 1 パスの JSON 配列として記録されます。
 
 ファイルには実行時設定（`config`）と探索結果（`result`）を含むJSONオブジェクトが出力されます。
 

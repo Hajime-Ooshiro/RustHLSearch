@@ -296,7 +296,11 @@ impl State {
         let file = fs::File::create(&temporary_path)?;
         serde_json::to_writer_pretty(file, &checkpoint)?;
         if path.exists() {
-            fs::remove_file(path)?;
+            let backup_path = path.with_extension("bak");
+            if backup_path.exists() {
+                fs::remove_file(&backup_path)?;
+            }
+            fs::rename(path, backup_path)?;
         }
         fs::rename(temporary_path, path)?;
         Ok(())
@@ -618,7 +622,10 @@ mod tests {
             .search_with_checkpoint(1, Some(&path), Some(&path))
             .unwrap();
 
-        std::fs::remove_file(path).unwrap();
+        let backup_path = path.with_extension("bak");
+        assert!(backup_path.exists());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(backup_path).unwrap();
     }
 
     #[test]

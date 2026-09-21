@@ -1,6 +1,6 @@
 use crate::bitmask::BitMask;
 use indicatif::{ProgressBar, ProgressStyle};
-use log::info;
+use log::{debug, info};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -208,19 +208,13 @@ impl State {
 
             if self.node_count.is_multiple_of(self.checkpoint_interval) {
                 pb.set_position(self.node_count);
-                pb.set_message(format!(
-                    "best: {} | hits: {} | depth: {}",
+                debug!(
+                    "探索経過: nodes={} best={} hits={} depth={}",
+                    self.node_count,
                     self.max_count,
                     self.results,
                     self.key.len()
-                ));
-                // info!(
-                //     "探索経過: nodes={} best={} hits={} depth={}",
-                //     self.node_count,
-                //     self.max_count,
-                //     self.results,
-                //     self.key.len()
-                // );
+                );
                 checkpoint_due = true;
             }
 
@@ -235,11 +229,11 @@ impl State {
                     self.results = 1;
                     self.shifts.clear();
                     self.shifts.push(self.key.clone());
-                    // info!("best level={} key={:?} count={}", level, self.key, count);
+                    debug!("best level={} key={:?} count={}", level, self.key, count);
                 } else if count == self.max_count {
                     self.results += 1;
                     self.shifts.push(self.key.clone());
-                    // info!("best level={} key={:?} count={}", level, self.key, count);
+                    debug!("best level={} key={:?} count={}", level, self.key, count);
                 }
                 self.key.pop();
                 continue;
@@ -250,7 +244,8 @@ impl State {
                 next_idx: self.primes[level + 1],
             });
         }
-        pb.finish_with_message("探索完了");
+        pb.finish();
+        debug!("探索完了 (nodes={})", self.node_count);
         if let Some(path) = checkpoint_path {
             self.write_checkpoint(path, depth, &stack)?;
         }
@@ -368,12 +363,13 @@ impl State {
                     local_nodes = 0;
                     pb.set_position(n);
                     let shared = results.snapshot();
-                    pb.set_message(format!(
-                        "best: {} | hits: {} | depth: {}",
+                    debug!(
+                        "探索経過: nodes={} best={} hits={} depth={}",
+                        n,
                         shared.max_count,
                         shared.results,
                         key.len()
-                    ));
+                    );
                 }
 
                 if c_count < results.max_count.load(Ordering::Relaxed) {
@@ -395,7 +391,8 @@ impl State {
             node_count.fetch_add(local_nodes, Ordering::Relaxed);
         });
 
-        pb.finish_with_message("探索完了");
+        pb.finish();
+        debug!("並列探索完了 (nodes={})", node_count.load(Ordering::Relaxed));
         results.snapshot()
     }
 
@@ -437,7 +434,7 @@ impl State {
 }
 
 fn progress_bar() -> ProgressBar {
-    let pb = ProgressBar::new_spinner();
+    let pb = ProgressBar::hidden();
     pb.set_style(
         ProgressStyle::default_spinner()
             .template("{spinner:.green} [{elapsed_precise}] nodes: {human_pos} ({per_sec}) {msg}")
@@ -448,7 +445,7 @@ fn progress_bar() -> ProgressBar {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_shift_table, State};
+    use super::{build_shift_table, progress_bar, State};
 
     #[test]
     fn build_shift_table_creates_expected_complement_masks() {
@@ -514,6 +511,12 @@ mod tests {
         let mut state = State::new(vec![2], 4, table);
         state.checkpoint_interval = 5_000;
         assert_eq!(state.checkpoint_interval, 5_000);
+    }
+
+    #[test]
+    fn progress_bar_is_hidden() {
+        let pb = progress_bar();
+        assert!(pb.is_hidden());
     }
 
     #[test]

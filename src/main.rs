@@ -89,7 +89,7 @@ impl Cli {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    SimpleLogger::new().with_level(LevelFilter::Info).init()?;
+    SimpleLogger::new().with_level(LevelFilter::Debug).init()?;
     let cli = Cli::parse();
     let all_primes = generate_primes(MAX_PRIME);
 

@@ -1,6 +1,9 @@
 /// 素数生成（エラトステネスの篩）
+pub const MIN_PRIME: usize = 2;
+pub const MAX_PRIME: usize = 1579;
+
 pub fn generate_primes(limit: usize) -> Vec<usize> {
-    if limit < 2 {
+    if limit < MIN_PRIME {
         return Vec::new();
     }
     let mut is_prime = vec![true; limit + 1];
@@ -8,7 +11,7 @@ pub fn generate_primes(limit: usize) -> Vec<usize> {
     is_prime[1] = false;
 
     let sqrt_limit = (limit as f64).sqrt() as usize;
-    for p in 2..=sqrt_limit {
+    for p in MIN_PRIME..=sqrt_limit {
         if is_prime[p] {
             let mut step = p * p;
             while step <= limit {

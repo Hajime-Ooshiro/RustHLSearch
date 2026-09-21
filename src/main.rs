@@ -6,7 +6,7 @@ mod search;
 use clap::Parser;
 use log::{info, LevelFilter};
 use output::with_timestamp;
-use primes::generate_primes;
+use primes::{generate_primes, MAX_PRIME};
 use search::{build_shift_table, SearchMode, State};
 use serde::Serialize;
 use simple_logger::SimpleLogger;
@@ -56,8 +56,8 @@ pub struct Cli {
     #[arg(long, default_value_t = 3159, help = "列数 (長さ)")]
     pub cols: usize,
 
-    #[arg(short, long, default_value = "result.json", help = "出力ファイルパス")]
-    pub output: PathBuf,
+    #[arg(short, long, default_value = ".", help = "出力ディレクトリ")]
+    pub output_dir: PathBuf,
 
     #[arg(
         long,
@@ -91,7 +91,7 @@ impl Cli {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     SimpleLogger::new().with_level(LevelFilter::Info).init()?;
     let cli = Cli::parse();
-    let all_primes = generate_primes(1579);
+    let all_primes = generate_primes(MAX_PRIME);
 
     if let Err(message) = cli.validate(all_primes.len()) {
         eprintln!("エラー: {}", message);
@@ -152,10 +152,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("最大値: {}", state.max_count);
     info!("該当件数: {}", state.results);
 
-    let output_dir = cli.output.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(output_dir)?;
+    std::fs::create_dir_all(&cli.output_dir)?;
 
-    let shift_path = with_timestamp(&output_dir.join("shift_path.txt"), cli.depth);
+    let shift_path = with_timestamp(&cli.output_dir.join("shift_path.txt"), cli.depth);
     let shift_file = File::create(&shift_path)?;
     let mut shift_writer = BufWriter::new(shift_file);
     for shifts in &state.shifts {
@@ -164,7 +163,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     info!("シフトパス出力ファイル: {}", shift_path.display());
 
-    let result_path = with_timestamp(&output_dir.join("result.json"), cli.depth);
+    let result_path = with_timestamp(&cli.output_dir.join("result.json"), cli.depth);
     let result_file = File::create(&result_path)?;
     let mut result_writer = BufWriter::new(result_file);
     info!("探索結果出力ファイル: {}", result_path.display());
@@ -200,7 +199,7 @@ mod tests {
             depth: 1,
             mode: SearchMode::Sequential,
             cols: 4,
-            output: PathBuf::from("shift_path.txt"),
+            output_dir: PathBuf::from("."),
             checkpoint_interval: 100_000,
         }
     }

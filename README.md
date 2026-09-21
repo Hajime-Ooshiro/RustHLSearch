@@ -98,7 +98,7 @@ cargo run --release -- --mode sequential --checkpoint-interval 50000
 深さ、列数、出力先を指定して実行:
 
 ```bash
-cargo run --release -- --depth 10 --cols 4000 -o result.json
+cargo run --release -- --depth 10 --cols 4000 --output-dir results
 ```
 
 > **Note**: 並列モード時のスレッド数は Rayon の既定値（論理コア数）となります。環境変数 `RAYON_NUM_THREADS` でスレッド数を指定可能です。
@@ -140,7 +140,7 @@ cargo run --release -- --depth 10 --cols 4000 -o result.json
 | `--depth` | `-d` | `8` | 探索する階層数（使用する素数の個数） |
 | `--mode` | `-m` | `parallel` | 探索モード（`parallel` または `sequential`） |
 | `--cols` | | `3159` | ビット列の長さ |
-| `--output` | `-o` | `result.json` | 出力先パス（親ディレクトリに結果ファイルを出力） |
+| `--output-dir` | `-o` | `.` | 出力ディレクトリ |
 | `--checkpoint-interval` | | `100000` | チェックポイント保存周期 (ノード数) |
 
 ## 出力ファイル形式

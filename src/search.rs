@@ -141,6 +141,20 @@ impl State {
         }
     }
 
+    fn aggregate_leaf_result(&mut self, count: usize, key: &[usize]) {
+        if count > self.max_count {
+            self.max_count = count;
+            self.results = 1;
+            self.shifts.clear();
+            self.shifts.push(key.to_vec());
+            debug!("best level={} key={:?} count={}", key.len() - 1, key, count);
+        } else if count == self.max_count {
+            self.results += 1;
+            self.shifts.push(key.to_vec());
+            debug!("best level={} key={:?} count={}", key.len() - 1, key, count);
+        }
+    }
+
     pub fn search_with_checkpoint(
         &mut self,
         depth: usize,
@@ -224,17 +238,8 @@ impl State {
             }
 
             if level + 1 >= depth {
-                if count > self.max_count {
-                    self.max_count = count;
-                    self.results = 1;
-                    self.shifts.clear();
-                    self.shifts.push(self.key.clone());
-                    debug!("best level={} key={:?} count={}", level, self.key, count);
-                } else if count == self.max_count {
-                    self.results += 1;
-                    self.shifts.push(self.key.clone());
-                    debug!("best level={} key={:?} count={}", level, self.key, count);
-                }
+                let key = self.key.clone();
+                self.aggregate_leaf_result(count, &key);
                 self.key.pop();
                 continue;
             }

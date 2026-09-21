@@ -120,7 +120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let checkpoint_path = Path::new(CHECKPOINT_PATH);
             let resume_path = checkpoint_path.exists().then_some(checkpoint_path);
             state.search_with_checkpoint(cli.depth, Some(checkpoint_path), resume_path)?;
-            let searched_path = with_timestamp(Path::new("searched.json"));
+            let searched_path = with_timestamp(Path::new("searched.json"), cli.depth);
             std::fs::rename(checkpoint_path, &searched_path)?;
             info!(
                 "チェックポイントを探索済みファイルへ変更: {}",
@@ -146,7 +146,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("最大値: {}", state.max_count);
     info!("該当件数: {}", state.results);
 
-    let output_path = with_timestamp(&cli.output);
+    let output_path = with_timestamp(&cli.output, cli.depth);
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent)?;
     }

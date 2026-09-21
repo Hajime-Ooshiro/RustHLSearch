@@ -146,7 +146,7 @@ cargo run --release -- --depth 10 --cols 4000 -o result.json
 
 ## 出力ファイル形式
 
-出力ファイル名には実行時のタイムスタンプが付与されます（例: `shift_path.json` の場合 `shift_path_YYYYMMDD_HHMMSS.json`）。
+出力ファイル名には探索深さと実行時のタイムスタンプが付与されます（例: `shift_path.json` を深さ 8 で実行した場合 `shift_path_depth8_YYYYMMDD_HHMMSS.json`）。
 
 ファイルには実行時設定（`config`）と探索結果（`result`）を含むJSONオブジェクトが出力されます。
 

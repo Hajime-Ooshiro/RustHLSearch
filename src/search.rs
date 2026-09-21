@@ -33,14 +33,8 @@ pub fn build_shift_table(primes: &[usize], cols: usize) -> Vec<Vec<BitMask>> {
     shift_table
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct Frame {
-    level: usize,
-    next_idx: usize,
-}
-
-#[derive(Deserialize, Serialize)]
-struct StackFrame {
     level: usize,
     next_idx: usize,
 }
@@ -50,7 +44,7 @@ struct Checkpoint {
     depth: usize,
     primes: Vec<usize>,
     cols: usize,
-    stack: Vec<StackFrame>,
+    stack: Vec<Frame>,
     key: Vec<usize>,
     max_count: usize,
     results: usize,
@@ -275,18 +269,11 @@ impl State {
             }
         }
         let temporary_path = path.with_extension("tmp");
-        let stack_frames = stack
-            .iter()
-            .map(|f| StackFrame {
-                level: f.level,
-                next_idx: f.next_idx,
-            })
-            .collect();
         let checkpoint = Checkpoint {
             depth,
             primes: self.primes.clone(),
             cols: self.zero_mask.size(),
-            stack: stack_frames,
+            stack: stack.to_vec(),
             key: self.key.clone(),
             max_count: self.max_count,
             results: self.results,
@@ -308,7 +295,7 @@ impl State {
 
     fn rebuild_stack_and_masks(
         &mut self,
-        saved_stack: &[StackFrame],
+        saved_stack: &[Frame],
     ) -> Result<Vec<Frame>, Box<dyn std::error::Error>> {
         let mut stack = Vec::new();
 
@@ -316,10 +303,7 @@ impl State {
             if frame.level >= self.primes.len() {
                 return Err("Invalid stack frame level".into());
             }
-            stack.push(Frame {
-                level: frame.level,
-                next_idx: frame.next_idx,
-            });
+            stack.push(Frame { ..*frame });
         }
 
         Ok(stack)
@@ -544,7 +528,7 @@ mod tests {
         state.max_count = 2;
         state.results = 0;
 
-        let saved_stack = vec![super::StackFrame {
+        let saved_stack = vec![super::Frame {
             level: 1,
             next_idx: 2,
         }];
@@ -560,7 +544,7 @@ mod tests {
     #[test]
     fn stack_frame_serialization_is_lightweight() {
         use serde_json;
-        let frame = super::StackFrame {
+        let frame = super::Frame {
             level: 5,
             next_idx: 42,
         };
@@ -577,7 +561,7 @@ mod tests {
             depth: 2,
             primes: vec![2, 3],
             cols: 4,
-            stack: vec![super::StackFrame {
+            stack: vec![super::Frame {
                 level: 0,
                 next_idx: 1,
             }],
@@ -637,7 +621,7 @@ mod tests {
 
         state.key = vec![1, 2, 1];
 
-        let saved_stack = vec![super::StackFrame {
+        let saved_stack = vec![super::Frame {
             level: 2,
             next_idx: 3,
         }];

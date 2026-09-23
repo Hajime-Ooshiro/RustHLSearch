@@ -127,31 +127,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 backup_path.exists().then_some(backup_path.as_path())
             };
             state.search_with_checkpoint(cli.depth, Some(&checkpoint_path), resume_path)?;
-            let searched_path =
-                with_timestamp(&cli.output_dir.join("searched.json"), cli.depth);
-            std::fs::rename(&checkpoint_path, &searched_path)?;
-            if backup_path.exists() {
-                std::fs::remove_file(&backup_path)?;
-            }
-            info!(
-                "チェックポイントを探索済みファイルへ変更: {}",
-                searched_path.display()
-            );
         }
         SearchMode::Parallel => {
-            if checkpoint_path.exists() || backup_path.exists() {
-                return Err(format!(
-                    "{} または {} は sequential モードでのみ再開できます。--mode sequential を指定してください",
-                    checkpoint_path.display(),
-                    backup_path.display()
-                )
-                .into());
-            }
-            let result = state.search_parallel(cli.depth);
+            let resume_path = if checkpoint_path.exists() {
+                Some(checkpoint_path.as_path())
+            } else {
+                backup_path.exists().then_some(backup_path.as_path())
+            };
+            let result =
+                state.search_parallel(cli.depth, Some(&checkpoint_path), resume_path)?;
             state.max_count = result.max_count;
             state.results = result.results;
             state.shifts = result.shifts;
         }
+    }
+
+    if checkpoint_path.exists() {
+        let searched_path = with_timestamp(&cli.output_dir.join("searched.json"), cli.depth);
+        std::fs::rename(&checkpoint_path, &searched_path)?;
+        if backup_path.exists() {
+            std::fs::remove_file(&backup_path)?;
+        }
+        info!(
+            "チェックポイントを探索済みファイルへ変更: {}",
+            searched_path.display()
+        );
     }
 
     let elapsed = start_time.elapsed();

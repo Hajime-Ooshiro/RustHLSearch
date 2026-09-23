@@ -10,7 +10,7 @@ HLSearch（素数シフト探索）の Rust 実装です。指定した深さま
 - **popcount 上界による枝刈り**: 部分木の popcount は現在値を超えられないため、現在の最大値未満の枝を打ち切る。
 - **降順探索**: 各素数のシフト候補を降順（$p-1 \dots 0$）に探索。
 - **ログ出力の制御**: 主要イベントは `INFO`、詳細な探索経過は `DEBUG` として出力する（既定のログレベルは `INFO`）。進捗バーは使用していません。
-- **チェックポイント再開**: 逐次モードでは 100,000 ノードごとに進捗を更新し、`--output-dir` 配下の `checkpoint.json` へ保存・再開可能。
+- **チェックポイント再開**: 逐次・並列ともに 100,000 ノードごとに進捗を更新し、`--output-dir` 配下の `checkpoint.json` へ保存・再開可能。並列モードでは完了した分割タスクと実行中タスクのスタックを保存します。
 
 ## ビルド
 
@@ -85,17 +85,23 @@ cargo run --release -- --mode sequential --depth 8
 cargo run --release -- --mode sequential
 ```
 
-逐次モードでは 100,000 ノードごとに進捗を更新し、DFS のスタックと集計値を `--output-dir`（既定は `.`）配下の `checkpoint.json` に自動保存します。更新前の世代は同じディレクトリの `checkpoint.bak` に退避されます。起動時に `checkpoint.json` が存在しない場合は `checkpoint.bak` から復旧を試みます。探索が正常終了すると `checkpoint.json` は同じディレクトリ内で `searched_depth8_YYYYMMDD_HHMMSS.json` のようなファイル名に改名され、バックアップも削除されます。チェックポイント機能は探索順序を保てる逐次モード専用です。並列モード起動時に、指定した `--output-dir` に `checkpoint.json` または `checkpoint.bak` が残っているとエラーになります。
+並列探索も同じファイルへチェックポイントを保存し、同じコマンドで再開できます:
+
+```bash
+cargo run --release -- --mode parallel
+```
+
+探索中は 100,000 ノードごとに進捗を更新し、DFS の状態と集計値を `--output-dir`（既定は `.`）配下の `checkpoint.json` に自動保存します。更新前の世代は同じディレクトリの `checkpoint.bak` に退避されます。起動時に `checkpoint.json` が存在しない場合は `checkpoint.bak` から復旧を試みます。探索が正常終了すると `checkpoint.json` は同じディレクトリ内で `searched_depth8_YYYYMMDD_HHMMSS.json` のようなファイル名に改名され、バックアップも削除されます。逐次チェックポイントは `--mode sequential` でのみ、並列チェックポイントは `--mode parallel` でのみ再開できます。
 
 ログは `SimpleLogger` により既定で `INFO` レベル以上が出力されます。主要イベントは `INFO`、詳細な探索経過は `DEBUG` として実装されていますが、既定のログレベルでは `DEBUG` ログは表示されません。進捗バーは使用しておらず、ログ出力のみで進捗を確認します。
 
 チェックポイント保存周期を変更する場合:
 
 ```bash
-cargo run --release -- --mode sequential --checkpoint-interval 50000
+cargo run --release -- --checkpoint-interval 50000
 ```
 
-`--checkpoint-interval` でノード数を指定できます（デフォルト: 100,000）。
+`--checkpoint-interval` でノード数を指定できます（デフォルト: 100,000）。逐次・並列のどちらでも有効です。
 
 深さ、列数、出力先を指定して実行:
 

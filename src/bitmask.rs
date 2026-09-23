@@ -19,8 +19,24 @@ impl BitMask {
     }
 
     /// `lhs & rhs` を既存の領域へ格納し、1 ビット数を返す
+    ///
+    /// # Panics
+    /// `self`, `lhs`, `rhs` の論理サイズが一致しない場合、デバッグビルドではパニックする。
     #[inline]
     pub fn bitand_into_count(&mut self, lhs: &Self, rhs: &Self) -> usize {
+        debug_assert_eq!(
+            self.size, lhs.size,
+            "bitand_into_count: self.size ({}) != lhs.size ({})",
+            self.size, lhs.size
+        );
+        debug_assert_eq!(
+            self.size, rhs.size,
+            "bitand_into_count: self.size ({}) != rhs.size ({})",
+            self.size, rhs.size
+        );
+        debug_assert_eq!(self.data.len(), lhs.data.len());
+        debug_assert_eq!(self.data.len(), rhs.data.len());
+
         self.data
             .iter_mut()
             .zip(lhs.data.iter().zip(rhs.data.iter()))
@@ -31,7 +47,6 @@ impl BitMask {
             })
             .sum()
     }
-
     /// 1 (true) のビット数をカウント (popcount)
     #[inline]
     pub fn count_ones(&self) -> usize {

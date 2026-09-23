@@ -182,7 +182,7 @@ impl State {
                 checkpoint.node_count
             );
 
-            self.rebuild_stack_and_masks(&checkpoint.stack)?
+            self.restore_stack(&checkpoint.stack)?
         } else {
             vec![Frame {
                 level: 0,
@@ -289,7 +289,7 @@ impl State {
         Ok(())
     }
 
-    fn rebuild_stack_and_masks(
+    fn restore_stack(
         &mut self,
         saved_stack: &[Frame],
     ) -> Result<Vec<Frame>, Box<dyn std::error::Error>> {
@@ -502,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_stack_and_masks_recovers_search_position() {
+    fn restore_stack_recovers_search_position() {
         let primes = vec![2, 3];
         let cols = 4;
         let table = build_shift_table(&primes, cols);
@@ -518,7 +518,7 @@ mod tests {
             next_idx: 2,
         }];
 
-        let rebuilt_stack = state.rebuild_stack_and_masks(&saved_stack).unwrap();
+        let rebuilt_stack = state.restore_stack(&saved_stack).unwrap();
 
         assert_eq!(rebuilt_stack.len(), 1);
         assert_eq!(rebuilt_stack[0].level, 1);
@@ -611,7 +611,7 @@ mod tests {
             next_idx: 3,
         }];
 
-        let rebuilt = state.rebuild_stack_and_masks(&saved_stack).unwrap();
+        let rebuilt = state.restore_stack(&saved_stack).unwrap();
         assert_eq!(rebuilt.len(), 1);
         assert_eq!(rebuilt[0].level, 2);
 

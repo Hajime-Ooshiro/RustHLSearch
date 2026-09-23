@@ -1,5 +1,4 @@
 use crate::bitmask::BitMask;
-use indicatif::{ProgressBar, ProgressStyle};
 use log::{debug, info};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -161,7 +160,6 @@ impl State {
         checkpoint_path: Option<&Path>,
         resume_path: Option<&Path>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let pb = progress_bar();
         let mut stack = if let Some(path) = resume_path {
             let checkpoint: Checkpoint = serde_json::from_reader(std::fs::File::open(path)?)?;
             if checkpoint.depth != depth
@@ -221,8 +219,7 @@ impl State {
                 node_masks[0].bitand_into_count(&base_masks[level], &self.shift_table[level][i]);
 
             if self.node_count.is_multiple_of(self.checkpoint_interval) {
-                pb.set_position(self.node_count);
-                debug!(
+                info!(
                     "探索経過: nodes={} best={} hits={} depth={}",
                     self.node_count,
                     self.max_count,
@@ -249,8 +246,7 @@ impl State {
                 next_idx: self.primes[level + 1],
             });
         }
-        pb.finish();
-        debug!("探索完了 (nodes={})", self.node_count);
+        info!("探索完了 (nodes={})", self.node_count);
         if let Some(path) = checkpoint_path {
             self.write_checkpoint(path, depth, &stack)?;
         }
@@ -325,7 +321,6 @@ impl State {
             results: Mutex::new(SharedResults::default()),
         });
         let node_count = Arc::new(AtomicU64::new(0));
-        let pb = progress_bar();
 
         let split_depth = self.parallel_split_depth(depth);
         let work_items = self.parallel_work_items(split_depth);
@@ -366,9 +361,8 @@ impl State {
                 if local_nodes == self.checkpoint_interval {
                     let n = node_count.fetch_add(local_nodes, Ordering::Relaxed) + local_nodes;
                     local_nodes = 0;
-                    pb.set_position(n);
                     let shared = results.snapshot();
-                    debug!(
+                    info!(
                         "探索経過: nodes={} best={} hits={} depth={}",
                         n,
                         shared.max_count,
@@ -396,8 +390,7 @@ impl State {
             node_count.fetch_add(local_nodes, Ordering::Relaxed);
         });
 
-        pb.finish();
-        debug!("並列探索完了 (nodes={})", node_count.load(Ordering::Relaxed));
+        info!("並列探索完了 (nodes={})", node_count.load(Ordering::Relaxed));
         results.snapshot()
     }
 
@@ -438,19 +431,9 @@ impl State {
     }
 }
 
-fn progress_bar() -> ProgressBar {
-    let pb = ProgressBar::hidden();
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.green} [{elapsed_precise}] nodes: {human_pos} ({per_sec}) {msg}")
-            .unwrap(),
-    );
-    pb
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{build_shift_table, progress_bar, State};
+    use super::{build_shift_table, State};
 
     #[test]
     fn build_shift_table_creates_expected_complement_masks() {
@@ -516,12 +499,6 @@ mod tests {
         let mut state = State::new(vec![2], 4, table);
         state.checkpoint_interval = 5_000;
         assert_eq!(state.checkpoint_interval, 5_000);
-    }
-
-    #[test]
-    fn progress_bar_is_hidden() {
-        let pb = progress_bar();
-        assert!(pb.is_hidden());
     }
 
     #[test]

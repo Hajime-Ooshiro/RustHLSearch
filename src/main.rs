@@ -12,11 +12,11 @@ use serde::Serialize;
 use simple_logger::SimpleLogger;
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
-const CHECKPOINT_PATH: &str = "checkpoint.json";
-const CHECKPOINT_BACKUP_PATH: &str = "checkpoint.bak";
+const CHECKPOINT_FILENAME: &str = "checkpoint.json";
+const CHECKPOINT_BACKUP_FILENAME: &str = "checkpoint.bak";
 
 #[derive(Serialize)]
 struct OutputFile<'a> {
@@ -89,7 +89,7 @@ impl Cli {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    SimpleLogger::new().with_level(LevelFilter::Debug).init()?;
+    SimpleLogger::new().with_level(LevelFilter::Info).init()?;
     let cli = Cli::parse();
     let all_primes = generate_primes(MAX_PRIME);
 
@@ -113,20 +113,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut state = State::new(primes, cli.cols, shift_table);
     state.checkpoint_interval = cli.checkpoint_interval;
 
+    // 探索中にチェックポイントを書き出すため、他の出力より先に output_dir を用意する
+    std::fs::create_dir_all(&cli.output_dir)?;
+
+    let checkpoint_path = cli.output_dir.join(CHECKPOINT_FILENAME);
+    let backup_path = cli.output_dir.join(CHECKPOINT_BACKUP_FILENAME);
+
     match cli.mode {
         SearchMode::Sequential => {
-            let checkpoint_path = Path::new(CHECKPOINT_PATH);
-            let backup_path = Path::new(CHECKPOINT_BACKUP_PATH);
             let resume_path = if checkpoint_path.exists() {
-                Some(checkpoint_path)
+                Some(checkpoint_path.as_path())
             } else {
-                backup_path.exists().then_some(backup_path)
+                backup_path.exists().then_some(backup_path.as_path())
             };
-            state.search_with_checkpoint(cli.depth, Some(checkpoint_path), resume_path)?;
-            let searched_path = with_timestamp(Path::new("searched.json"), cli.depth);
-            std::fs::rename(checkpoint_path, &searched_path)?;
+            state.search_with_checkpoint(cli.depth, Some(&checkpoint_path), resume_path)?;
+            let searched_path =
+                with_timestamp(&cli.output_dir.join("searched.json"), cli.depth);
+            std::fs::rename(&checkpoint_path, &searched_path)?;
             if backup_path.exists() {
-                std::fs::remove_file(backup_path)?;
+                std::fs::remove_file(&backup_path)?;
             }
             info!(
                 "チェックポイントを探索済みファイルへ変更: {}",
@@ -134,11 +139,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         SearchMode::Parallel => {
-            if Path::new(CHECKPOINT_PATH).exists() || Path::new(CHECKPOINT_BACKUP_PATH).exists() {
-                return Err(
-                    "checkpoint.json または checkpoint.bak は sequential モードでのみ再開できます。--mode sequential を指定してください"
-                        .into(),
-                );
+            if checkpoint_path.exists() || backup_path.exists() {
+                return Err(format!(
+                    "{} または {} は sequential モードでのみ再開できます。--mode sequential を指定してください",
+                    checkpoint_path.display(),
+                    backup_path.display()
+                )
+                .into());
             }
             let result = state.search_parallel(cli.depth);
             state.max_count = result.max_count;
@@ -151,8 +158,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("探索時間: {:?}", elapsed);
     info!("最大値: {}", state.max_count);
     info!("該当件数: {}", state.results);
-
-    std::fs::create_dir_all(&cli.output_dir)?;
 
     let shift_path = with_timestamp(&cli.output_dir.join("shift_path.txt"), cli.depth);
     let shift_file = File::create(&shift_path)?;

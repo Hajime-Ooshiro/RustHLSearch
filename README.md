@@ -9,8 +9,8 @@ HLSearch（素数シフト探索）の Rust 実装です。指定した深さま
 - **割り当てを抑えたビット演算**: 深さごとの作業バッファを再利用し、AND 演算と popcount を1回の走査で実行。
 - **popcount 上界による枝刈り**: 部分木の popcount は現在値を超えられないため、現在の最大値未満の枝を打ち切る。
 - **降順探索**: 各素数のシフト候補を降順（$p-1 \dots 0$）に探索。
-- **ログ出力の制御**: 進捗バーはログに出力せず、主要イベントは `INFO`、詳細な探索経過は `DEBUG` で出力する。
-- **チェックポイント再開**: 逐次モードでは 100,000 ノードごとに進捗を更新し、`checkpoint.json` へ保存・再開可能。
+- **ログ出力の制御**: 主要イベントは `INFO`、詳細な探索経過は `DEBUG` として出力する（既定のログレベルは `INFO`）。進捗バーは使用していません。
+- **チェックポイント再開**: 逐次モードでは 100,000 ノードごとに進捗を更新し、`--output-dir` 配下の `checkpoint.json` へ保存・再開可能。
 
 ## ビルド
 
@@ -79,15 +79,15 @@ cargo run --release
 cargo run --release -- --mode sequential --depth 8
 ```
 
-逐次探索では `checkpoint.json` を自動保存・再開します:
+逐次探索では `--output-dir`（既定はカレントディレクトリ）配下に `checkpoint.json` を自動保存・再開します:
 
 ```bash
 cargo run --release -- --mode sequential
 ```
 
-逐次モードでは 100,000 ノードごとに進捗を更新し、DFS のスタックと集計値を `checkpoint.json` に自動保存します。更新前の世代は `checkpoint.bak` に退避されます。起動時に `checkpoint.json` が存在しない場合は `checkpoint.bak` から復旧を試みます。探索が正常終了すると `checkpoint.json` は `searched_YYYYMMDD_HHMMSS.json` に改名され、バックアップも削除されます。チェックポイント機能は探索順序を保てる逐次モード専用です。並列モード起動時に `checkpoint.json` または `checkpoint.bak` があるとエラーになります。
+逐次モードでは 100,000 ノードごとに進捗を更新し、DFS のスタックと集計値を `--output-dir`（既定は `.`）配下の `checkpoint.json` に自動保存します。更新前の世代は同じディレクトリの `checkpoint.bak` に退避されます。起動時に `checkpoint.json` が存在しない場合は `checkpoint.bak` から復旧を試みます。探索が正常終了すると `checkpoint.json` は同じディレクトリ内で `searched_depth8_YYYYMMDD_HHMMSS.json` のようなファイル名に改名され、バックアップも削除されます。チェックポイント機能は探索順序を保てる逐次モード専用です。並列モード起動時に、指定した `--output-dir` に `checkpoint.json` または `checkpoint.bak` が残っているとエラーになります。
 
-ログは `SimpleLogger` により `DEBUG` レベルで出力され、主要イベントは `INFO`、詳細な探索経過は `DEBUG` として扱われます。進捗バーは表示せず、ログやファイル出力に混ざらないようにしています。
+ログは `SimpleLogger` により既定で `INFO` レベル以上が出力されます。主要イベントは `INFO`、詳細な探索経過は `DEBUG` として実装されていますが、既定のログレベルでは `DEBUG` ログは表示されません。進捗バーは使用しておらず、ログ出力のみで進捗を確認します。
 
 チェックポイント保存周期を変更する場合:
 

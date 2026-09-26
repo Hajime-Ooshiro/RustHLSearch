@@ -67,7 +67,7 @@ cargo run --release -- --help
 
 ### 実行例
 
-デフォルト（並列モード、深さ 8、cols 3159）:
+デフォルト（Best-First モード、深さ 8、cols 3159）:
 
 ```bash
 cargo run --release
@@ -91,7 +91,7 @@ cargo run --release -- --mode sequential
 cargo run --release -- --mode parallel
 ```
 
-探索中は 100,000 ノードごとに進捗を更新し、DFS の状態と集計値を `--output-dir`（既定は `.`）配下の `checkpoint.json` に自動保存します。更新前の世代は同じディレクトリの `checkpoint.bak` に退避されます。起動時に `checkpoint.json` が存在しない場合は `checkpoint.bak` から復旧を試みます。探索が正常終了すると `checkpoint.json` は同じディレクトリ内で `searched_depth8_YYYYMMDD_HHMMSS.json` のようなファイル名に改名され、バックアップも削除されます。逐次チェックポイントは `--mode sequential` でのみ、並列チェックポイントは `--mode parallel` でのみ再開できます。
+探索中は 100,000 ノードごとに進捗を更新し、探索 frontier と集計値を `--output-dir`（既定は `.`）配下の `checkpoint.json` に自動保存します。Best-First では優先度付きキューの frontier、逐次/並列モードでは DFS の状態を保存します。更新前の世代は同じディレクトリの `checkpoint.bak` に退避されます。起動時に `checkpoint.json` が存在しない場合は `checkpoint.bak` から復旧を試みます。探索が正常終了すると `checkpoint.json` は同じディレクトリ内で `searched_depth8_YYYYMMDD_HHMMSS.json` のようなファイル名に改名され、バックアップも削除されます。チェックポイントは作成した探索モードと同じ `--mode` でのみ再開できます。
 
 ログは `SimpleLogger` により既定で `INFO` レベル以上が出力されます。主要イベントは `INFO`、詳細な探索経過は `DEBUG` として実装されていますが、既定のログレベルでは `DEBUG` ログは表示されません。進捗バーは使用しておらず、ログ出力のみで進捗を確認します。
 
@@ -136,7 +136,8 @@ cargo run --release -- --depth 10 --cols 4000 --output-dir results
 
 ### 探索モード
 
-- `--mode parallel`（デフォルト）: Rayon のワーカ数に応じて先頭の複数階層を分割し、複数スレッドで並列 DFS します。各階層のシフト候補は降順で処理されます。
+- `--mode best-first`（デフォルト）: Branch & Bound を使い、上界の大きいノードを優先する Best-First 探索を実行します。
+- `--mode parallel`: Rayon のワーカ数に応じて先頭の複数階層を分割し、複数スレッドで並列 DFS します。各階層のシフト候補は降順で処理されます。
 - `--mode sequential`: 単一スレッドで決定論的に非再帰 DFS を実行します。探索中の結果集計とビット列更新は別関数に分離して扱います。
 
 並列モードではスレッドの実行順序により、記録されるシフトパスの順序が逐次モードと異なる場合があります。
@@ -146,7 +147,7 @@ cargo run --release -- --depth 10 --cols 4000 --output-dir results
 | フラグ | 短縮 | 既定値 | 説明 |
 | --- | --- | --- | --- |
 | `--depth` | `-d` | `8` | 探索する階層数（使用する素数の個数） |
-| `--mode` | `-m` | `parallel` | 探索モード（`parallel` または `sequential`） |
+| `--mode` | `-m` | `best-first` | 探索モード（`best-first`、`parallel` または `sequential`） |
 | `--cols` | | `3159` | ビット列の長さ |
 | `--output-dir` | `-o` | `.` | 出力ディレクトリ |
 | `--checkpoint-interval` | | `100000` | チェックポイント保存周期 (ノード数) |

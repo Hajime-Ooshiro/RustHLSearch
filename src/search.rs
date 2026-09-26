@@ -2,7 +2,8 @@ use crate::bitmask::BitMask;
 use log::{debug, info};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -69,14 +70,23 @@ struct Checkpoint {
     completed: Vec<usize>,
     #[serde(default)]
     in_progress: Vec<ParallelInProgress>,
+    #[serde(default)]
+    best_first_frontier: Vec<BestFirstCheckpointNode>,
+    #[serde(default)]
+    best_first_next_seq: u64,
+    /// 探索を絞り込んだ params 設定。古いチェックポイントとの互換性のため
+    /// 未設定時は空 (= 全シフト探索) として扱う。
+    #[serde(default)]
+    params: Vec<Vec<usize>>,
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, clap::ValueEnum, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SearchMode {
     Sequential,
-    #[default]
     Parallel,
+    #[default]
+    BestFirst,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -159,6 +169,45 @@ struct ParallelJob {
     resume: Option<(Vec<Frame>, Vec<usize>)>,
 }
 
+/// Best-First 探索用の priority queue ノード。
+/// `upper_bound` が大きいノードから展開する。
+struct BestFirstNode {
+    upper_bound: usize,
+    seq: u64,
+    level: usize,
+    key: Vec<usize>,
+    mask: BitMask,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct BestFirstCheckpointNode {
+    seq: u64,
+    level: usize,
+    key: Vec<usize>,
+}
+
+impl PartialEq for BestFirstNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.upper_bound == other.upper_bound && self.seq == other.seq
+    }
+}
+
+impl Eq for BestFirstNode {}
+
+impl PartialOrd for BestFirstNode {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for BestFirstNode {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        self.upper_bound
+            .cmp(&other.upper_bound)
+            .then_with(|| self.seq.cmp(&other.seq))
+    }
+}
+
 pub struct State {
     pub primes: Vec<usize>,
     pub key: Vec<usize>,
@@ -169,10 +218,18 @@ pub struct State {
     pub node_count: u64,
     pub checkpoint_interval: u64,
     shift_table: Vec<Vec<BitMask>>,
+    /// レベルごとに探索対象シフトを制限する設定値 (未指定/空 = 全シフトを探索)。
+    /// チェックポイントとの整合性チェックにも使う。
+    params: Vec<Vec<usize>>,
+    /// params から解決された、各レベルで実際に探索するシフトインデックス一覧。
+    /// params[level] が空・未指定なら 0..primes[level] のフルレンジになる。
+    shift_candidates: Vec<Vec<usize>>,
 }
 
 impl State {
     pub fn new(primes: Vec<usize>, cols: usize, shift_table: Vec<Vec<BitMask>>) -> Self {
+        let shift_candidates: Vec<Vec<usize>> =
+            primes.iter().map(|&p| (0..p).collect()).collect();
         State {
             primes,
             key: Vec::new(),
@@ -183,7 +240,47 @@ impl State {
             node_count: 0,
             checkpoint_interval: 100_000,
             shift_table,
+            params: Vec::new(),
+            shift_candidates,
         }
+    }
+
+    /// レベルごとの探索対象シフトを params で絞り込む。
+    ///
+    /// `params[level]` が指定されていて空でなければ、そのレベルでは
+    /// リストに含まれるシフトインデックスのみを探索する。
+    /// `params[level]` が存在しない、または空の場合は従来通り
+    /// 全シフト (`0..primes[level]`) を探索する。
+    ///
+    /// # Errors
+    /// 指定されたシフトインデックスが対応する素数の範囲 (`0..primes[level]`) 外の場合、
+    /// エラーを返す。`params` の要素数が `primes.len()` を超える分は無視される。
+    pub fn set_params(&mut self, params: Vec<Vec<usize>>) -> Result<(), String> {
+        for (level, shifts) in params.iter().enumerate() {
+            if level >= self.primes.len() {
+                break;
+            }
+            for &shift in shifts {
+                if shift >= self.primes[level] {
+                    return Err(format!(
+                        "params[{}] のシフト値 {} が素数 {} の範囲外です (0..{} である必要があります)",
+                        level, shift, self.primes[level], self.primes[level]
+                    ));
+                }
+            }
+        }
+
+        for (level, shifts) in params.iter().enumerate() {
+            if level >= self.shift_candidates.len() {
+                break;
+            }
+            if !shifts.is_empty() {
+                self.shift_candidates[level] = shifts.clone();
+            }
+        }
+
+        self.params = params;
+        Ok(())
     }
 
     fn aggregate_leaf_result(&mut self, count: usize, key: &[usize]) {
@@ -198,6 +295,236 @@ impl State {
             self.shifts.push(key.to_vec());
             debug!("best level={} key={:?} count={}", key.len() - 1, key, count);
         }
+    }
+
+    /// 残りの level について「各 level で選べる shift のうち、
+    /// 現在の mask と最も多く重なるもの」を求め、その最小値を
+    /// 最終的な count の上界として返す。
+    ///
+    /// 任意の完成解の mask は各残り level の選択 mask との共通部分なので、
+    /// 完成解の count は各 level の最大重なり以下である。したがって
+    /// その最小値は admissible な upper bound になる。
+    fn best_first_upper_bound(&self, level: usize, depth: usize, mask: &BitMask) -> usize {
+        let mut upper_bound = mask.count_ones();
+        for future_level in level..depth {
+            let mut level_max = 0usize;
+            for &shift in &self.shift_candidates[future_level] {
+                let count = mask
+                    .clone()
+                    .bitand_into_count(mask, &self.shift_table[future_level][shift]);
+                level_max = level_max.max(count);
+                if level_max == upper_bound {
+                    break;
+                }
+            }
+            upper_bound = upper_bound.min(level_max);
+            if upper_bound == 0 {
+                break;
+            }
+        }
+        upper_bound
+    }
+
+    /// Branch & Bound + Best-First 探索。
+    ///
+    /// priority queue から upper bound の大きいノードを先に展開し、
+    /// 上界が現在の best を下回るノードは探索しない。
+    /// 既存の DFS (`search_with_checkpoint`) はそのまま残す。
+    pub fn search_best_first(
+        &mut self,
+        depth: usize,
+        checkpoint_path: Option<&Path>,
+        resume_path: Option<&Path>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if depth == 0 {
+            return Err("depth は 1 以上である必要があります".into());
+        }
+        if depth > self.primes.len() {
+            return Err(format!(
+                "depth={} が primes.len()={} を超えています",
+                depth,
+                self.primes.len()
+            )
+            .into());
+        }
+
+        let (mut queue, mut next_seq) = if let Some(path) = resume_path {
+            let checkpoint = Self::load_checkpoint(path)?;
+            if checkpoint.mode != SearchMode::BestFirst {
+                return Err("このチェックポイントは --mode best-first でのみ再開できます".into());
+            }
+            self.apply_checkpoint_config(&checkpoint, depth)?;
+            self.max_count = checkpoint.max_count;
+            self.results = checkpoint.results;
+            self.shifts = checkpoint.shifts;
+            self.node_count = checkpoint.node_count;
+            let queue = self.restore_best_first_frontier(&checkpoint.best_first_frontier, depth)?;
+            info!(
+                "Best-First チェックポイントから再開しました (nodes={})",
+                self.node_count
+            );
+            (queue, checkpoint.best_first_next_seq)
+        } else {
+            self.key.clear();
+            self.max_count = 0;
+            self.results = 0;
+            self.shifts.clear();
+            self.node_count = 0;
+
+            let root_mask = self.zero_mask.clone();
+            let root_upper_bound = self.best_first_upper_bound(0, depth, &root_mask);
+            let mut queue = BinaryHeap::new();
+            queue.push(BestFirstNode {
+                upper_bound: root_upper_bound,
+                seq: 0,
+                level: 0,
+                key: Vec::with_capacity(depth),
+                mask: root_mask,
+            });
+            (queue, 1)
+        };
+        let mut checkpoint_due = false;
+
+        while let Some(node) = queue.pop() {
+            if node.upper_bound < self.max_count {
+                continue;
+            }
+
+            if node.level == depth {
+                let count = node.mask.count_ones();
+                self.aggregate_leaf_result(count, &node.key);
+                continue;
+            }
+
+            let level = node.level;
+            let shifts = self.shift_candidates[level].clone();
+            for shift in shifts {
+                let mut child_mask = node.mask.clone();
+                let count = child_mask
+                    .bitand_into_count(&node.mask, &self.shift_table[level][shift]);
+                self.node_count += 1;
+                if self.node_count.is_multiple_of(self.checkpoint_interval) {
+                    info!(
+                        "Best-First 探索経過: nodes={} best={} hits={} depth={}",
+                        self.node_count,
+                        self.max_count,
+                        self.results,
+                        node.level + 1
+                    );
+                    checkpoint_due = true;
+                }
+
+                if count < self.max_count {
+                    continue;
+                }
+
+                let child_level = level + 1;
+                let mut child_key = node.key.clone();
+                child_key.push(shift);
+
+                if child_level >= depth {
+                    self.aggregate_leaf_result(count, &child_key);
+                    continue;
+                }
+
+                let upper_bound =
+                    self.best_first_upper_bound(child_level, depth, &child_mask);
+                if upper_bound < self.max_count {
+                    continue;
+                }
+
+                queue.push(BestFirstNode {
+                    upper_bound,
+                    seq: next_seq,
+                    level: child_level,
+                    key: child_key,
+                    mask: child_mask,
+                });
+                next_seq = next_seq.wrapping_add(1);
+            }
+
+            if checkpoint_due {
+                if let Some(path) = checkpoint_path {
+                    self.write_best_first_checkpoint(path, depth, &queue, next_seq)?;
+                }
+                checkpoint_due = false;
+            }
+        }
+        if let Some(path) = checkpoint_path {
+            self.write_best_first_checkpoint(path, depth, &queue, next_seq)?;
+        }
+
+        info!(
+            "Best-First 探索完了 (nodes={}, best={}, hits={})",
+            self.node_count, self.max_count, self.results
+        );
+        Ok(())
+    }
+
+    fn restore_best_first_frontier(
+        &self,
+        saved_frontier: &[BestFirstCheckpointNode],
+        depth: usize,
+    ) -> Result<BinaryHeap<BestFirstNode>, Box<dyn std::error::Error>> {
+        let mut queue = BinaryHeap::new();
+        for saved_node in saved_frontier {
+            if saved_node.level >= depth
+                || saved_node.key.len() != saved_node.level
+                || saved_node.key.iter().enumerate().any(|(level, &shift)| {
+                    !self.shift_candidates[level].contains(&shift)
+                })
+            {
+                return Err("Best-First チェックポイントの frontier が不正です".into());
+            }
+            let masks = self.rebuild_masks(saved_node.level, &saved_node.key);
+            let mask = masks.last().expect("マスク列に root が必要です").clone();
+            let upper_bound = self.best_first_upper_bound(saved_node.level, depth, &mask);
+            queue.push(BestFirstNode {
+                upper_bound,
+                seq: saved_node.seq,
+                level: saved_node.level,
+                key: saved_node.key.clone(),
+                mask,
+            });
+        }
+        Ok(queue)
+    }
+
+    fn write_best_first_checkpoint(
+        &self,
+        path: &Path,
+        depth: usize,
+        queue: &BinaryHeap<BestFirstNode>,
+        next_seq: u64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.write_checkpoint_file(
+            path,
+            &Checkpoint {
+                mode: SearchMode::BestFirst,
+                depth,
+                primes: self.primes.clone(),
+                cols: self.zero_mask.size(),
+                stack: Vec::new(),
+                key: Vec::new(),
+                max_count: self.max_count,
+                results: self.results,
+                shifts: self.shifts.clone(),
+                node_count: self.node_count,
+                split_depth: 0,
+                completed: Vec::new(),
+                in_progress: Vec::new(),
+                best_first_frontier: queue
+                    .iter()
+                    .map(|node| BestFirstCheckpointNode {
+                        seq: node.seq,
+                        level: node.level,
+                        key: node.key.clone(),
+                    })
+                    .collect(),
+                best_first_next_seq: next_seq,
+                params: self.params.clone(),
+            },
+        )
     }
 
     pub fn search_with_checkpoint(
@@ -228,7 +555,7 @@ impl State {
         } else {
             vec![Frame {
                 level: 0,
-                next_idx: self.primes[0],
+                next_idx: self.shift_candidates[0].len(),
             }]
         };
         let mut masks = self.rebuild_masks(depth, &self.key);
@@ -250,9 +577,9 @@ impl State {
                 continue;
             }
 
-            frame.next_idx -= 1;
-            let i = frame.next_idx;
             let level = frame.level;
+            frame.next_idx -= 1;
+            let i = self.shift_candidates[level][frame.next_idx];
             self.key.push(i);
             self.node_count += 1;
 
@@ -285,7 +612,7 @@ impl State {
 
             stack.push(Frame {
                 level: level + 1,
-                next_idx: self.primes[level + 1],
+                next_idx: self.shift_candidates[level + 1].len(),
             });
         }
         info!("探索完了 (nodes={})", self.node_count);
@@ -317,6 +644,9 @@ impl State {
                 split_depth: 0,
                 completed: Vec::new(),
                 in_progress: Vec::new(),
+                best_first_frontier: Vec::new(),
+                best_first_next_seq: 0,
+                params: self.params.clone(),
             },
         )
     }
@@ -357,10 +687,11 @@ impl State {
         if checkpoint.depth != depth
             || checkpoint.primes != self.primes
             || checkpoint.cols != self.zero_mask.size()
+            || checkpoint.params != self.params
         {
             return Err(format!(
-                "チェックポイントの探索設定が現在の設定と一致しません (depth={}, cols={})",
-                checkpoint.depth, checkpoint.cols
+                "チェックポイントの探索設定が現在の設定と一致しません (depth={}, cols={}, params={:?})",
+                checkpoint.depth, checkpoint.cols, checkpoint.params
             )
             .into());
         }
@@ -538,7 +869,7 @@ impl State {
             }
             let stack = vec![Frame {
                 level: ctx.split_depth,
-                next_idx: self.primes[ctx.split_depth],
+                next_idx: self.shift_candidates[ctx.split_depth].len(),
             }];
             (key, masks, stack)
         };
@@ -560,9 +891,9 @@ impl State {
                 continue;
             }
 
-            frame.next_idx -= 1;
-            let idx = frame.next_idx;
             let level = frame.level;
+            frame.next_idx -= 1;
+            let idx = self.shift_candidates[level][frame.next_idx];
             key.push(idx);
             local_nodes += 1;
             let (base_masks, node_masks) = masks.split_at_mut(level + 1);
@@ -597,7 +928,7 @@ impl State {
 
             stack.push(Frame {
                 level: level + 1,
-                next_idx: self.primes[level + 1],
+                next_idx: self.shift_candidates[level + 1].len(),
             });
         }
 
@@ -688,6 +1019,9 @@ impl State {
                 split_depth: ctx.split_depth,
                 completed,
                 in_progress,
+                best_first_frontier: Vec::new(),
+                best_first_next_seq: 0,
+                params: self.params.clone(),
             },
         )
         .map_err(|err| err.to_string())?;
@@ -699,7 +1033,7 @@ impl State {
         let target_tasks = rayon::current_num_threads() * 4;
         let mut task_count: usize = 1;
         for level in 0..depth {
-            task_count = task_count.saturating_mul(self.primes[level]);
+            task_count = task_count.saturating_mul(self.shift_candidates[level].len());
             if task_count >= target_tasks {
                 return level + 1;
             }
@@ -714,9 +1048,10 @@ impl State {
         }];
 
         for level in 0..split_depth {
-            let mut next_items = Vec::with_capacity(work_items.len() * self.primes[level]);
+            let candidates = &self.shift_candidates[level];
+            let mut next_items = Vec::with_capacity(work_items.len() * candidates.len());
             for item in work_items {
-                for shift in (0..self.primes[level]).rev() {
+                for &shift in candidates.iter().rev() {
                     let mut base_mask = self.zero_mask.clone();
                     let _ = base_mask
                         .bitand_into_count(&item.base_mask, &self.shift_table[level][shift]);
@@ -785,6 +1120,194 @@ mod tests {
         assert_eq!(result.max_count, 2);
         assert_eq!(result.results, 2);
         assert_eq!(result.shifts.len(), 2);
+    }
+
+    #[test]
+    fn best_first_matches_sequential_and_finds_all_best_leaves() {
+        let primes = vec![2, 3, 5];
+        let cols = 8;
+        let depth = 3;
+        let table = build_shift_table(&primes, cols);
+
+        let mut sequential = State::new(primes.clone(), cols, table.clone());
+        sequential.search_with_checkpoint(depth, None, None).unwrap();
+
+        let mut best_first = State::new(primes, cols, table);
+        best_first.search_best_first(depth, None, None).unwrap();
+
+        assert_eq!(best_first.max_count, sequential.max_count);
+        assert_eq!(best_first.results, sequential.results);
+        assert_eq!(best_first.shifts.len(), sequential.shifts.len());
+        for shifts in &best_first.shifts {
+            assert_eq!(shifts.len(), depth);
+        }
+    }
+
+    #[test]
+    fn best_first_checkpoint_restores_frontier_and_results() {
+        let primes = vec![2, 3];
+        let cols = 8;
+        let depth = 2;
+        let table = build_shift_table(&primes, cols);
+        let path = unique_checkpoint_path("best-first-checkpoint");
+
+        let mut expected = State::new(primes.clone(), cols, table.clone());
+        expected.search_best_first(depth, None, None).unwrap();
+
+        let mut saved = State::new(primes.clone(), cols, table.clone());
+        let mut frontier = super::BinaryHeap::new();
+        for (index, &shift) in saved.shift_candidates[0].iter().enumerate() {
+            let mut mask = saved.zero_mask.clone();
+            mask.bitand_into_count(&saved.zero_mask, &saved.shift_table[0][shift]);
+            let upper_bound = saved.best_first_upper_bound(1, depth, &mask);
+            frontier.push(super::BestFirstNode {
+                upper_bound,
+                seq: index as u64 + 1,
+                level: 1,
+                key: vec![shift],
+                mask,
+            });
+        }
+        saved.node_count = frontier.len() as u64;
+        saved
+            .write_best_first_checkpoint(&path, depth, &frontier, frontier.len() as u64 + 1)
+            .unwrap();
+
+        let mut resumed = State::new(primes, cols, table);
+        resumed
+            .search_best_first(depth, Some(&path), Some(&path))
+            .unwrap();
+
+        assert_eq!(resumed.max_count, expected.max_count);
+        assert_eq!(resumed.results, expected.results);
+        let mut expected_shifts = expected.shifts;
+        let mut resumed_shifts = resumed.shifts;
+        expected_shifts.sort();
+        resumed_shifts.sort();
+        assert_eq!(resumed_shifts, expected_shifts);
+
+        let backup_path = path.with_extension("bak");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(backup_path);
+    }
+
+    #[test]
+    fn best_first_respects_params() {
+        let primes = vec![2, 3, 5];
+        let cols = 8;
+        let depth = 3;
+        let table = build_shift_table(&primes, cols);
+
+        let mut state = State::new(primes, cols, table);
+        state.set_params(vec![vec![1], vec![], vec![0, 2]]).unwrap();
+        state.search_best_first(depth, None, None).unwrap();
+
+        assert!(!state.shifts.is_empty());
+        for shifts in &state.shifts {
+            assert_eq!(shifts[0], 1);
+            assert!(shifts[2] == 0 || shifts[2] == 2);
+        }
+    }
+
+    #[test]
+    fn set_params_restricts_search_to_specified_shifts() {
+        let primes = vec![2, 3];
+        let cols = 4;
+        let table = build_shift_table(&primes, cols);
+        let mut state = State::new(primes.clone(), cols, table);
+        state.set_params(vec![vec![0]]).unwrap();
+        state.search_with_checkpoint(2, None, None).unwrap();
+
+        assert!(!state.shifts.is_empty());
+        for shifts in &state.shifts {
+            assert_eq!(shifts[0], 0, "level0 は params で shift=0 に限定されているはず");
+        }
+    }
+
+    #[test]
+    fn set_params_leaves_unspecified_levels_at_full_range() {
+        let primes = vec![2, 3];
+        let cols = 4;
+        let table = build_shift_table(&primes, cols);
+
+        let mut restricted = State::new(primes.clone(), cols, table.clone());
+        restricted.set_params(vec![vec![0]]).unwrap();
+        restricted.search_with_checkpoint(2, None, None).unwrap();
+
+        let mut baseline = State::new(primes.clone(), cols, table);
+        baseline.set_params(vec![vec![0], vec![]]).unwrap();
+        baseline.search_with_checkpoint(2, None, None).unwrap();
+
+        // level1 は params 未指定/空なので、どちらも全シフト (0..3) を探索して同じ結果になる
+        assert_eq!(restricted.max_count, baseline.max_count);
+        assert_eq!(restricted.shifts, baseline.shifts);
+    }
+
+    #[test]
+    fn set_params_rejects_out_of_range_shift() {
+        let primes = vec![2, 3];
+        let cols = 4;
+        let table = build_shift_table(&primes, cols);
+        let mut state = State::new(primes, cols, table);
+        let err = state.set_params(vec![vec![2]]).unwrap_err();
+        assert!(err.contains("範囲外"));
+    }
+
+    #[test]
+    fn parallel_search_respects_params_and_matches_sequential() {
+        let primes = vec![2, 3, 5];
+        let cols = 8;
+        let depth = 3;
+        let table = build_shift_table(&primes, cols);
+
+        let mut sequential = State::new(primes.clone(), cols, table.clone());
+        sequential.set_params(vec![vec![1], vec![], vec![0, 2]]).unwrap();
+        sequential.search_with_checkpoint(depth, None, None).unwrap();
+
+        let mut parallel = State::new(primes, cols, table);
+        parallel.set_params(vec![vec![1], vec![], vec![0, 2]]).unwrap();
+        let result = parallel.search_parallel(depth, None, None).unwrap();
+
+        assert_eq!(result.max_count, sequential.max_count);
+        assert_eq!(result.results, sequential.results);
+        for shifts in &result.shifts {
+            assert_eq!(shifts[0], 1);
+            assert!(shifts[2] == 0 || shifts[2] == 2);
+        }
+    }
+
+    #[test]
+    fn resume_rejects_mismatched_params() {
+        let primes = vec![2];
+        let cols = 4;
+        let table = build_shift_table(&primes, cols);
+        let path = unique_checkpoint_path("params-mismatch");
+
+        let mut saved = State::new(primes.clone(), cols, table.clone());
+        saved.set_params(vec![vec![0]]).unwrap();
+        saved
+            .write_checkpoint(
+                &path,
+                1,
+                &[super::Frame {
+                    level: 0,
+                    next_idx: 1,
+                }],
+            )
+            .unwrap();
+
+        let mut resumed = State::new(primes, cols, table);
+        // params を設定せず (=全シフト探索) に再開しようとすると、
+        // チェックポイントの params (shift=0 のみ) と一致せずエラーになる
+        let err = resumed
+            .search_with_checkpoint(1, Some(&path), Some(&path))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("一致しません"));
+
+        let backup_path = path.with_extension("bak");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(backup_path);
     }
 
     #[test]
@@ -860,6 +1383,9 @@ mod tests {
             split_depth: 0,
             completed: vec![],
             in_progress: vec![],
+            best_first_frontier: Vec::new(),
+            best_first_next_seq: 0,
+            params: vec![],
         };
         let json = serde_json::to_string_pretty(&checkpoint).unwrap();
         assert!(json.contains("depth"));
@@ -997,6 +1523,9 @@ mod tests {
                     split_depth,
                     completed,
                     in_progress: Vec::new(),
+                    best_first_frontier: Vec::new(),
+                    best_first_next_seq: 0,
+                    params: Vec::new(),
                 },
             )
             .unwrap();
@@ -1069,6 +1598,9 @@ mod tests {
                     split_depth: 1,
                     completed: Vec::new(),
                     in_progress: Vec::new(),
+                    best_first_frontier: Vec::new(),
+                    best_first_next_seq: 0,
+                    params: Vec::new(),
                 },
             )
             .unwrap();

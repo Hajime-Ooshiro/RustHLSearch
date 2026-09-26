@@ -48,8 +48,8 @@ pub struct Cli {
         short,
         long,
         value_enum,
-        default_value_t = SearchMode::Parallel,
-        help = "探索モード (sequential | parallel)"
+        default_value_t = SearchMode::BestFirst,
+        help = "探索モード (best-first | sequential | parallel)"
     )]
     pub mode: SearchMode,
 
@@ -65,6 +65,14 @@ pub struct Cli {
         help = "チェックポイント保存周期 (ノード数)"
     )]
     pub checkpoint_interval: u64,
+
+    #[arg(
+        long,
+        help = "探索するシフトを制限する params 設定ファイル (JSON)。\
+                形式: [[level0で探索するシフト,...], [level1で探索するシフト,...], ...]。\
+                レベルが未指定または空配列の場合はそのレベルの全シフトを探索する (例: [[0]] は level0 のみ shift=0 に限定)"
+    )]
+    pub params_file: Option<PathBuf>,
 }
 
 impl Cli {
@@ -113,6 +121,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut state = State::new(primes, cli.cols, shift_table);
     state.checkpoint_interval = cli.checkpoint_interval;
 
+    if let Some(params_path) = &cli.params_file {
+        let params_json = std::fs::read_to_string(params_path).map_err(|err| {
+            format!(
+                "paramsファイルの読み込みに失敗しました ({}): {}",
+                params_path.display(),
+                err
+            )
+        })?;
+        let params: Vec<Vec<usize>> = serde_json::from_str(&params_json).map_err(|err| {
+            format!(
+                "paramsファイルの解析に失敗しました ({}): {}",
+                params_path.display(),
+                err
+            )
+        })?;
+        state.set_params(params)?;
+        info!("paramsファイルを読み込みました: {}", params_path.display());
+    }
+
     // 探索中にチェックポイントを書き出すため、他の出力より先に output_dir を用意する
     std::fs::create_dir_all(&cli.output_dir)?;
 
@@ -139,6 +166,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             state.max_count = result.max_count;
             state.results = result.results;
             state.shifts = result.shifts;
+        }
+        SearchMode::BestFirst => {
+            let resume_path = if checkpoint_path.exists() {
+                Some(checkpoint_path.as_path())
+            } else {
+                backup_path.exists().then_some(backup_path.as_path())
+            };
+            state.search_best_first(cli.depth, Some(&checkpoint_path), resume_path)?;
         }
     }
 
@@ -178,6 +213,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             mode: match cli.mode {
                 SearchMode::Sequential => "sequential",
                 SearchMode::Parallel => "parallel",
+                SearchMode::BestFirst => "best-first",
             },
             depth: cli.depth,
             cols: cli.cols,
@@ -206,12 +242,19 @@ mod tests {
             cols: 4,
             output_dir: PathBuf::from("."),
             checkpoint_interval: 100_000,
+            params_file: None,
         }
     }
 
     #[test]
     fn cli_validation_accepts_valid_configuration() {
         assert!(test_cli().validate(3).is_ok());
+    }
+
+    #[test]
+    fn cli_defaults_to_best_first_mode() {
+        let cli = Cli::try_parse_from(["hlsearch"]).unwrap();
+        assert_eq!(cli.mode, SearchMode::BestFirst);
     }
 
     #[test]

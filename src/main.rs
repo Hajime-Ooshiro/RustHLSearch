@@ -2,6 +2,7 @@ mod bitmask;
 mod output;
 mod primes;
 mod search;
+mod sqlite_output;
 
 use clap::Parser;
 use log::{info, LevelFilter};
@@ -115,6 +116,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 探索中にチェックポイントを書き出すため、他の出力より先に output_dir を用意する
     std::fs::create_dir_all(&cli.output_dir)?;
+    let shift_path = cli.output_dir.join("HLSearch.db");
+    state.set_shift_path_store(&shift_path)?;
 
     let checkpoint_path = cli.output_dir.join(CHECKPOINT_FILENAME);
     let backup_path = cli.output_dir.join(CHECKPOINT_BACKUP_FILENAME);
@@ -159,16 +162,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("最大値: {}", state.max_count);
     info!("該当件数: {}", state.results);
 
-    let shift_path = with_timestamp(&cli.output_dir.join("shift_path.txt"), cli.depth);
-    let shift_file = File::create(&shift_path)?;
-    let mut shift_writer = BufWriter::new(shift_file);
-    for shifts in &state.shifts {
-        serde_json::to_writer(&mut shift_writer, shifts)?;
-        writeln!(shift_writer)?;
-    }
-    info!("シフトパス出力ファイル: {}", shift_path.display());
+    info!("シフトパスSQLite出力ファイル: {}", shift_path.display());
 
-    let result_path = with_timestamp(&cli.output_dir.join("result.json"), cli.depth);
+    let result_path = with_timestamp(&cli.output_dir.join("result.txt"), cli.depth);
     let result_file = File::create(&result_path)?;
     let mut result_writer = BufWriter::new(result_file);
     info!("探索結果出力ファイル: {}", result_path.display());

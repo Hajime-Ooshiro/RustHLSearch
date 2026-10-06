@@ -1,4 +1,5 @@
 use crate::bitmask::BitMask;
+use crate::sqlite_output::ShiftPathStore;
 use log::{debug, info};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -89,27 +90,35 @@ pub struct SharedResults {
 struct ParallelResults {
     max_count: AtomicUsize,
     results: Mutex<SharedResults>,
+    target: usize,
+    shift_path_store: Option<ShiftPathStore>,
 }
 
 impl ParallelResults {
-    fn record_best(&self, count: usize, key: &[usize]) {
+    fn record_best(&self, count: usize, key: &[usize]) -> Result<(), String> {
         loop {
             let current = self.max_count.load(Ordering::Relaxed);
             if count < current {
-                return;
+                return Ok(());
             }
-            if count < target {
-                return;
+            if count < self.target {
+                return Ok(());
             }
             if count == current {
                 let mut results = self.results.lock().unwrap();
                 if self.max_count.load(Ordering::Relaxed) == count
-                    && !results.shifts.iter().any(|existing| existing.as_slice() == key)
+                    && !results
+                        .shifts
+                        .iter()
+                        .any(|existing| existing.as_slice() == key)
                 {
+                    if let Some(store) = &self.shift_path_store {
+                        store.append(count, key)?;
+                    }
                     results.results += 1;
                     results.shifts.push(key.to_vec());
                 }
-                return;
+                return Ok(());
             }
             if self
                 .max_count
@@ -118,11 +127,14 @@ impl ParallelResults {
             {
                 let mut results = self.results.lock().unwrap();
                 if self.max_count.load(Ordering::Relaxed) == count {
+                    if let Some(store) = &self.shift_path_store {
+                        store.replace_all(count, &[key.to_vec()])?;
+                    }
                     results.results = 1;
                     results.shifts.clear();
                     results.shifts.push(key.to_vec());
                 }
-                return;
+                return Ok(());
             }
         }
     }
@@ -173,6 +185,7 @@ pub struct State {
     pub node_count: u64,
     pub checkpoint_interval: u64,
     shift_table: Vec<Vec<BitMask>>,
+    shift_path_store: Option<ShiftPathStore>,
 }
 
 impl State {
@@ -188,24 +201,44 @@ impl State {
             node_count: 0,
             checkpoint_interval: 100_000,
             shift_table,
+            shift_path_store: None,
         }
     }
 
-    fn aggregate_leaf_result(&mut self, count: usize, key: &[usize]) {
+    pub fn set_shift_path_store(&mut self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        self.shift_path_store = Some(ShiftPathStore::create(path).map_err(std::io::Error::other)?);
+        Ok(())
+    }
+
+    fn sync_shift_path_store(&self) -> Result<(), String> {
+        if let Some(store) = &self.shift_path_store {
+            store.replace_all(self.max_count, &self.shifts)?;
+        }
+        Ok(())
+    }
+
+    fn aggregate_leaf_result(&mut self, count: usize, key: &[usize]) -> Result<(), String> {
         if count < self.target {
-            return;
+            return Ok(());
         }
         if count > self.max_count {
+            if let Some(store) = &self.shift_path_store {
+                store.replace_all(count, &[key.to_vec()])?;
+            }
             self.max_count = count;
             self.results = 1;
             self.shifts.clear();
             self.shifts.push(key.to_vec());
             debug!("best level={} key={:?} count={}", key.len() - 1, key, count);
         } else if count == self.max_count {
+            if let Some(store) = &self.shift_path_store {
+                store.append(count, key)?;
+            }
             self.results += 1;
             self.shifts.push(key.to_vec());
             debug!("best level={} key={:?} count={}", key.len() - 1, key, count);
         }
+        Ok(())
     }
 
     pub fn search_with_checkpoint(
@@ -227,6 +260,8 @@ impl State {
             self.results = checkpoint.results;
             self.shifts = checkpoint.shifts;
             self.node_count = checkpoint.node_count;
+            self.sync_shift_path_store()
+                .map_err(std::io::Error::other)?;
             info!(
                 "チェックポイントから探索を再開しました (nodes={})",
                 checkpoint.node_count
@@ -279,14 +314,15 @@ impl State {
                 checkpoint_due = true;
             }
 
-            if count < self.max_count {
+            if count < self.target {
                 self.key.pop();
                 continue;
             }
 
             if level + 1 >= depth {
                 let key = self.key.clone();
-                self.aggregate_leaf_result(count, &key);
+                self.aggregate_leaf_result(count, &key)
+                    .map_err(std::io::Error::other)?;
                 self.key.pop();
                 continue;
             }
@@ -410,6 +446,8 @@ impl State {
         let results = Arc::new(ParallelResults {
             max_count: AtomicUsize::new(0),
             results: Mutex::new(SharedResults::default()),
+            target: self.target,
+            shift_path_store: self.shift_path_store.clone(),
         });
         let node_count = Arc::new(AtomicU64::new(0));
         let progress = Mutex::new(ParallelProgress {
@@ -439,6 +477,11 @@ impl State {
                 results: checkpoint.results,
                 shifts: checkpoint.shifts.clone(),
             };
+            if let Some(store) = &self.shift_path_store {
+                store
+                    .replace_all(checkpoint.max_count, &checkpoint.shifts)
+                    .map_err(std::io::Error::other)?;
+            }
             {
                 let mut progress = progress.lock().unwrap();
                 progress.completed = checkpoint.completed.iter().copied().collect();
@@ -539,8 +582,10 @@ impl State {
             masks[ctx.split_depth] = work_item.base_mask;
             let key = work_item.key;
             if ctx.split_depth == depth {
-                ctx.results
-                    .record_best(masks[ctx.split_depth].count_ones(), &key);
+                let count = masks[ctx.split_depth].count_ones();
+                if count >= self.target {
+                    ctx.results.record_best(count, &key)?;
+                }
                 self.finish_parallel_job(index, ctx)?;
                 return Ok(());
             }
@@ -592,13 +637,13 @@ impl State {
                 self.write_parallel_checkpoint(ctx, false, true)?;
             }
 
-            if c_count < ctx.results.max_count.load(Ordering::Relaxed) {
+            if c_count < self.target {
                 key.pop();
                 continue;
             }
 
             if level + 1 >= depth {
-                ctx.results.record_best(c_count, &key);
+                ctx.results.record_best(c_count, &key)?;
                 key.pop();
                 continue;
             }
@@ -759,8 +804,10 @@ mod tests {
         let cols = 4;
         let table = build_shift_table(&primes, cols);
         let mut sequential = State::new(primes.clone(), cols, table.clone());
+        sequential.target = 0;
         sequential.search_with_checkpoint(2, None, None).unwrap();
-        let parallel = State::new(primes.clone(), cols, table);
+        let mut parallel = State::new(primes.clone(), cols, table);
+        parallel.target = 0;
         let result = parallel.search_parallel(2, None, None).unwrap();
 
         assert!(sequential.results > 0);
@@ -782,9 +829,11 @@ mod tests {
         let table = build_shift_table(&primes, cols);
 
         let mut sequential = State::new(primes.clone(), cols, table.clone());
+        sequential.target = 0;
         sequential.search_with_checkpoint(1, None, None).unwrap();
 
-        let parallel = State::new(primes, cols, table);
+        let mut parallel = State::new(primes, cols, table);
+        parallel.target = 0;
         let result = parallel.search_parallel(1, None, None).unwrap();
 
         assert_eq!(sequential.max_count, 2);
@@ -796,10 +845,60 @@ mod tests {
     }
 
     #[test]
+    fn sequential_search_writes_best_paths_to_sqlite() {
+        let primes = vec![2];
+        let cols = 4;
+        let table = build_shift_table(&primes, cols);
+        let path = std::env::temp_dir().join(format!(
+            "hlsearch-shift-paths-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut state = State::new(primes, cols, table);
+        state.target = 0;
+        state.set_shift_path_store(&path).unwrap();
+
+        state.search_with_checkpoint(1, None, None).unwrap();
+
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        let rows: Vec<(usize, String)> = connection
+            .prepare("SELECT max_count, shifts FROM shift_paths ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(rows, vec![(2, "[1]".to_string()), (2, "[0]".to_string())]);
+
+        drop(connection);
+        drop(state);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn checkpoint_interval_defaults_to_100k() {
         let table = build_shift_table(&[2], 4);
         let state = State::new(vec![2], 4, table);
         assert_eq!(state.checkpoint_interval, 100_000);
+    }
+
+    #[test]
+    fn target_defaults_to_447_and_prunes_smaller_counts() {
+        let primes = vec![2];
+        let cols = 4;
+        let table = build_shift_table(&primes, cols);
+        let mut sequential = State::new(primes.clone(), cols, table.clone());
+        assert_eq!(sequential.target, 447);
+
+        sequential.search_with_checkpoint(1, None, None).unwrap();
+        assert_eq!(sequential.results, 0);
+
+        let parallel = State::new(primes, cols, table);
+        let result = parallel.search_parallel(1, None, None).unwrap();
+        assert_eq!(result.results, 0);
     }
 
     #[test]

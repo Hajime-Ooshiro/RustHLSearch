@@ -117,7 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 探索中にチェックポイントを書き出すため、他の出力より先に output_dir を用意する
     std::fs::create_dir_all(&cli.output_dir)?;
     let shift_path = cli.output_dir.join("HLSearch.db");
-    state.set_shift_path_store(&shift_path)?;
+    state.set_shift_path_store(&shift_path, cli.depth)?;
 
     let checkpoint_path = cli.output_dir.join(CHECKPOINT_FILENAME);
     let backup_path = cli.output_dir.join(CHECKPOINT_BACKUP_FILENAME);

@@ -153,7 +153,7 @@ cargo run --release -- --depth 10 --cols 4000 --output-dir results
 
 ## 出力ファイル形式
 
-出力ファイルは、シフトパスを `HLSearch.db`、探索結果を `result_depth8_YYYYMMDD_HHMMSS.txt` の形式で出力します。シフトパスは探索中に SQLite の `shift_paths` テーブルへ逐次保存されます。実行開始時に既存のパスは初期化され、より大きい最大 popcount が見つかると、以前のパスは置き換えられます。
+出力ファイルは、シフトパスを `HLSearch.db`、探索結果を `result_depth8_YYYYMMDD_HHMMSS.txt` の形式で出力します。シフトパスは探索中に SQLite の `shift_paths` テーブルへ逐次保存されます。テーブルの主キーは `(depth, shifts)` で、実行開始時には対象深さの既存パスだけが初期化されます。より大きい最大 popcount が見つかると、同じ深さの以前のパスは置き換えられます。
 
 ファイルには実行時設定（`config`）と探索結果（`result`）を含むJSONオブジェクトが出力されます。
 

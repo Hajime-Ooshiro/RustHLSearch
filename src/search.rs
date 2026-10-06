@@ -205,8 +205,13 @@ impl State {
         }
     }
 
-    pub fn set_shift_path_store(&mut self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-        self.shift_path_store = Some(ShiftPathStore::create(path).map_err(std::io::Error::other)?);
+    pub fn set_shift_path_store(
+        &mut self,
+        path: &Path,
+        depth: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.shift_path_store =
+            Some(ShiftPathStore::create(path, depth).map_err(std::io::Error::other)?);
         Ok(())
     }
 
@@ -859,19 +864,22 @@ mod tests {
         ));
         let mut state = State::new(primes, cols, table);
         state.target = 0;
-        state.set_shift_path_store(&path).unwrap();
+        state.set_shift_path_store(&path, 1).unwrap();
 
         state.search_with_checkpoint(1, None, None).unwrap();
 
         let connection = rusqlite::Connection::open(&path).unwrap();
-        let rows: Vec<(usize, String)> = connection
-            .prepare("SELECT max_count, shifts FROM shift_paths ORDER BY id")
+        let rows: Vec<(usize, usize, String)> = connection
+            .prepare("SELECT depth, max_count, shifts FROM shift_paths ORDER BY shifts DESC")
             .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        assert_eq!(rows, vec![(2, "[1]".to_string()), (2, "[0]".to_string())]);
+        assert_eq!(
+            rows,
+            vec![(1, 2, "[1]".to_string()), (1, 2, "[0]".to_string())]
+        );
 
         drop(connection);
         drop(state);

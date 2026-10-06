@@ -98,6 +98,9 @@ impl ParallelResults {
             if count < current {
                 return;
             }
+            if count < target {
+                return;
+            }
             if count == current {
                 let mut results = self.results.lock().unwrap();
                 if self.max_count.load(Ordering::Relaxed) == count
@@ -164,6 +167,7 @@ pub struct State {
     pub key: Vec<usize>,
     pub zero_mask: BitMask,
     pub max_count: usize,
+    pub target: usize,
     pub results: usize,
     pub shifts: Vec<Vec<usize>>,
     pub node_count: u64,
@@ -178,6 +182,7 @@ impl State {
             key: Vec::new(),
             zero_mask: BitMask::new_ones(cols),
             max_count: 0,
+            target: 447,
             results: 0,
             shifts: Vec::new(),
             node_count: 0,
@@ -187,6 +192,9 @@ impl State {
     }
 
     fn aggregate_leaf_result(&mut self, count: usize, key: &[usize]) {
+        if count < self.target {
+            return;
+        }
         if count > self.max_count {
             self.max_count = count;
             self.results = 1;

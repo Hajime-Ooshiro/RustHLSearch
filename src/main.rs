@@ -146,15 +146,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if checkpoint_path.exists() {
-        let searched_path = with_timestamp(&cli.output_dir.join("searched.json"), cli.depth);
-        std::fs::rename(&checkpoint_path, &searched_path)?;
+        std::fs::remove_file(&checkpoint_path)?;
         if backup_path.exists() {
             std::fs::remove_file(&backup_path)?;
         }
-        info!(
-            "チェックポイントを探索済みファイルへ変更: {}",
-            searched_path.display()
-        );
+        info!("探索完了のためチェックポイントを削除: {}", checkpoint_path.display());
     }
 
     let elapsed = start_time.elapsed();

@@ -91,7 +91,7 @@ cargo run --release -- --mode sequential
 cargo run --release -- --mode parallel
 ```
 
-探索中は 100,000 ノードごとに進捗を更新し、DFS の状態と集計値を `--output-dir`（既定は `.`）配下の `checkpoint.json` に自動保存します。更新前の世代は同じディレクトリの `checkpoint.bak` に退避されます。起動時に `checkpoint.json` が存在しない場合は `checkpoint.bak` から復旧を試みます。探索が正常終了すると `checkpoint.json` とバックアップは削除されます。逐次チェックポイントは `--mode sequential` でのみ、並列チェックポイントは `--mode parallel` でのみ再開できます。
+探索中は 100,000 ノードごとに進捗を更新し、DFS の状態と集計値を `--output-dir`（既定は `.`）配下の `checkpoint.json` に自動保存します。シフトパスとターゲット一致パスは `HLSearch.db` に保存され、再開時にそこから復元します。更新前の世代は同じディレクトリの `checkpoint.bak` に退避されます。起動時に `checkpoint.json` が存在しない場合は `checkpoint.bak` から復旧を試みます。探索が正常終了すると `checkpoint.json` とバックアップは削除されます。逐次チェックポイントは `--mode sequential` でのみ、並列チェックポイントは `--mode parallel` でのみ再開できます。
 
 ログは `SimpleLogger` により既定で `INFO` レベル以上が出力されます。主要イベントは `INFO`、詳細な探索経過は `DEBUG` として実装されていますが、既定のログレベルでは `DEBUG` ログは表示されません。進捗バーは使用しておらず、ログ出力のみで進捗を確認します。
 
@@ -153,7 +153,7 @@ cargo run --release -- --depth 10 --cols 4000 --output-dir results
 
 ## 出力ファイル形式
 
-出力ファイルは、シフトパスを `HLSearch.db`、探索結果を `result_depth8_YYYYMMDD_HHMMSS.txt` の形式で出力します。シフトパスは探索中に SQLite の `shift_paths` テーブルへ逐次保存されます。テーブルの主キーは `(depth, shifts)` で、実行開始時には対象深さの既存パスだけが初期化されます。より大きい最大 popcount が見つかると、同じ深さの以前のパスは置き換えられます。
+出力ファイルは、シフトパスを `HLSearch.db`、探索結果を `result_depth8_YYYYMMDD_HHMMSS.txt` の形式で出力します。最大 popcount のシフトパスは探索中に SQLite の `shift_paths` テーブルへ逐次保存されます。テーブルの主キーは `(depth, shifts)` で、実行開始時には対象深さの既存パスだけが初期化されます。より大きい最大 popcount が見つかると、同じ深さの以前のパスは置き換えられます。深さ 249 でターゲット値 447 に一致したパスは、発見ごとに `target_paths` テーブルへ `(depth, target_count, target_shifts)` として追加されます。`target_paths` の主キーは `(depth, target_shifts)` です。
 
 ファイルには実行時設定（`config`）と探索結果（`result`）を含むJSONオブジェクトが出力されます。
 

@@ -53,6 +53,7 @@ impl BitMask {
         self.data.iter().map(|&w| w.count_ones() as usize).sum()
     }
 
+    #[cfg(test)]
     pub fn size(&self) -> usize {
         self.size
     }

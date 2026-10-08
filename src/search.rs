@@ -51,22 +51,19 @@ struct ParallelInProgress {
     key: Vec<usize>,
 }
 
+type ShiftPaths = Vec<Vec<usize>>;
+
 #[derive(Deserialize, Serialize)]
 struct Checkpoint {
     #[serde(default = "default_checkpoint_mode")]
     mode: SearchMode,
     depth: usize,
-    primes: Vec<usize>,
-    cols: usize,
     stack: Vec<Frame>,
     key: Vec<usize>,
     max_count: usize,
     results: usize,
-    shifts: Vec<Vec<usize>>,
     #[serde(default)]
     target_count: usize,
-    #[serde(default)]
-    target_shifts: Vec<Vec<usize>>,
     node_count: u64,
     #[serde(default)]
     split_depth: usize,
@@ -101,12 +98,17 @@ struct ParallelResults {
 }
 
 impl ParallelResults {
-    fn record_target(&self, depth: usize, count: usize, key: &[usize]) {
+    fn record_target(&self, depth: usize, count: usize, key: &[usize]) -> Result<(), String> {
         if depth == 249 && count == self.target {
             let mut results = self.results.lock().unwrap();
-            results.target_count += 1;
+            let target_count = results.target_count + 1;
+            if let Some(store) = &self.shift_path_store {
+                store.append_target(target_count, key)?;
+            }
+            results.target_count = target_count;
             results.target_shifts.push(key.to_vec());
         }
+        Ok(())
     }
 
     fn record_best(&self, count: usize, key: &[usize]) -> Result<(), String> {
@@ -233,17 +235,39 @@ impl State {
         &mut self,
         path: &Path,
         depth: usize,
+        clear_existing: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.shift_path_store =
-            Some(ShiftPathStore::create(path, depth).map_err(std::io::Error::other)?);
+        self.shift_path_store = Some(
+            ShiftPathStore::create(path, depth, clear_existing).map_err(std::io::Error::other)?,
+        );
         Ok(())
     }
 
-    fn sync_shift_path_store(&self) -> Result<(), String> {
-        if let Some(store) = &self.shift_path_store {
-            store.replace_all(self.max_count, &self.shifts)?;
+    fn load_checkpoint_paths(
+        &self,
+        expected_results: usize,
+        expected_target_count: usize,
+    ) -> Result<(ShiftPaths, ShiftPaths), String> {
+        let Some(store) = &self.shift_path_store else {
+            if expected_results == 0 && expected_target_count == 0 {
+                return Ok((Vec::new(), Vec::new()));
+            }
+            return Err(
+                "チェックポイントの結果パスを復元するための SQLite 出力がありません".to_string(),
+            );
+        };
+        let shifts = store.load_paths()?;
+        let target_shifts = store.load_target_paths()?;
+        if shifts.len() != expected_results || target_shifts.len() != expected_target_count {
+            return Err(format!(
+                "SQLite 出力の結果パス数がチェックポイントと一致しません (shifts={}/{}, targets={}/{})",
+                shifts.len(),
+                expected_results,
+                target_shifts.len(),
+                expected_target_count
+            ));
         }
-        Ok(())
+        Ok((shifts, target_shifts))
     }
 
     fn aggregate_leaf_result(&mut self, count: usize, key: &[usize]) -> Result<(), String> {
@@ -276,11 +300,21 @@ impl State {
         Ok(())
     }
 
-    fn aggregate_target_result(&mut self, depth: usize, count: usize, key: &[usize]) {
+    fn aggregate_target_result(
+        &mut self,
+        depth: usize,
+        count: usize,
+        key: &[usize],
+    ) -> Result<(), String> {
         if depth == 249 && count == self.target {
-            self.target_count += 1;
+            let target_count = self.target_count + 1;
+            if let Some(store) = &self.shift_path_store {
+                store.append_target(target_count, key)?;
+            }
+            self.target_count = target_count;
             self.target_shifts.push(key.to_vec());
         }
+        Ok(())
     }
 
     pub fn search_with_checkpoint(
@@ -300,12 +334,11 @@ impl State {
             self.key = checkpoint.key.clone();
             self.max_count = checkpoint.max_count;
             self.results = checkpoint.results;
-            self.shifts = checkpoint.shifts;
             self.target_count = checkpoint.target_count;
-            self.target_shifts = checkpoint.target_shifts;
-            self.node_count = checkpoint.node_count;
-            self.sync_shift_path_store()
+            (self.shifts, self.target_shifts) = self
+                .load_checkpoint_paths(checkpoint.results, checkpoint.target_count)
                 .map_err(std::io::Error::other)?;
+            self.node_count = checkpoint.node_count;
             info!(
                 "チェックポイントから探索を再開しました (nodes={})",
                 checkpoint.node_count
@@ -371,7 +404,8 @@ impl State {
 
             if level + 1 >= depth {
                 let key = self.key.clone();
-                self.aggregate_target_result(depth, count, &key);
+                self.aggregate_target_result(depth, count, &key)
+                    .map_err(std::io::Error::other)?;
                 self.aggregate_leaf_result(count, &key)
                     .map_err(std::io::Error::other)?;
                 self.key.pop();
@@ -401,15 +435,11 @@ impl State {
             &Checkpoint {
                 mode: SearchMode::Sequential,
                 depth,
-                primes: self.primes.clone(),
-                cols: self.zero_mask.size(),
                 stack: stack.to_vec(),
                 key: self.key.clone(),
                 max_count: self.max_count,
                 results: self.results,
-                shifts: self.shifts.clone(),
                 target_count: self.target_count,
-                target_shifts: self.target_shifts.clone(),
                 node_count: self.node_count,
                 split_depth: 0,
                 completed: Vec::new(),
@@ -430,7 +460,7 @@ impl State {
         }
         let temporary_path = path.with_extension("tmp");
         let file = fs::File::create(&temporary_path)?;
-        serde_json::to_writer_pretty(file, checkpoint)?;
+        serde_json::to_writer(file, checkpoint)?;
         if path.exists() {
             let backup_path = path.with_extension("bak");
             if backup_path.exists() {
@@ -451,13 +481,10 @@ impl State {
         checkpoint: &Checkpoint,
         depth: usize,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if checkpoint.depth != depth
-            || checkpoint.primes != self.primes
-            || checkpoint.cols != self.zero_mask.size()
-        {
+        if checkpoint.depth != depth {
             return Err(format!(
-                "チェックポイントの探索設定が現在の設定と一致しません (depth={}, cols={})",
-                checkpoint.depth, checkpoint.cols
+                "チェックポイントの探索深さが現在の設定と一致しません (depth={})",
+                checkpoint.depth
             )
             .into());
         }
@@ -525,18 +552,16 @@ impl State {
             results
                 .max_count
                 .store(checkpoint.max_count, Ordering::Relaxed);
+            let (shifts, target_shifts) = self
+                .load_checkpoint_paths(checkpoint.results, checkpoint.target_count)
+                .map_err(std::io::Error::other)?;
             *results.results.lock().unwrap() = SharedResults {
                 max_count: checkpoint.max_count,
                 results: checkpoint.results,
-                shifts: checkpoint.shifts.clone(),
+                shifts,
                 target_count: checkpoint.target_count,
-                target_shifts: checkpoint.target_shifts.clone(),
+                target_shifts,
             };
-            if let Some(store) = &self.shift_path_store {
-                store
-                    .replace_all(checkpoint.max_count, &checkpoint.shifts)
-                    .map_err(std::io::Error::other)?;
-            }
             {
                 let mut progress = progress.lock().unwrap();
                 progress.completed = checkpoint.completed.iter().copied().collect();
@@ -638,8 +663,8 @@ impl State {
             let key = work_item.key;
             if ctx.split_depth == depth {
                 let count = masks[ctx.split_depth].count_ones();
-                ctx.results.record_target(depth, count, &key);
-                    ctx.results.record_best(count, &key)?;
+                ctx.results.record_target(depth, count, &key)?;
+                ctx.results.record_best(count, &key)?;
                 self.finish_parallel_job(index, ctx)?;
                 return Ok(());
             }
@@ -704,7 +729,7 @@ impl State {
             // }
 
             if level + 1 >= depth {
-                ctx.results.record_target(depth, c_count, &key);
+                ctx.results.record_target(depth, c_count, &key)?;
                 ctx.results.record_best(c_count, &key)?;
                 key.pop();
                 continue;
@@ -792,15 +817,11 @@ impl State {
             &Checkpoint {
                 mode: SearchMode::Parallel,
                 depth: ctx.depth,
-                primes: self.primes.clone(),
-                cols: self.zero_mask.size(),
                 stack: Vec::new(),
                 key: Vec::new(),
                 max_count: shared.max_count,
                 results: shared.results,
-                shifts: shared.shifts,
                 target_count: shared.target_count,
-                target_shifts: shared.target_shifts,
                 node_count: n,
                 split_depth: ctx.split_depth,
                 completed,
@@ -923,7 +944,7 @@ mod tests {
         ));
         let mut state = State::new(primes, cols, table);
         state.target = 0;
-        state.set_shift_path_store(&path, 1).unwrap();
+        state.set_shift_path_store(&path, 1, true).unwrap();
 
         state.search_with_checkpoint(1, None, None).unwrap();
 
@@ -974,9 +995,9 @@ mod tests {
         let mut state = State::new(vec![2], 4, table);
         let key = vec![1];
 
-        state.aggregate_target_result(249, 447, &key);
-        state.aggregate_target_result(248, 447, &key);
-        state.aggregate_target_result(249, 446, &key);
+        state.aggregate_target_result(249, 447, &key).unwrap();
+        state.aggregate_target_result(248, 447, &key).unwrap();
+        state.aggregate_target_result(249, 446, &key).unwrap();
 
         assert_eq!(state.target_count, 1);
         assert_eq!(state.target_shifts, vec![key]);
@@ -1034,8 +1055,6 @@ mod tests {
         let checkpoint = super::Checkpoint {
             mode: super::SearchMode::Sequential,
             depth: 2,
-            primes: vec![2, 3],
-            cols: 4,
             stack: vec![super::Frame {
                 level: 0,
                 next_idx: 1,
@@ -1043,9 +1062,7 @@ mod tests {
             key: vec![1],
             max_count: 2,
             results: 0,
-            shifts: vec![],
             target_count: 0,
-            target_shifts: vec![],
             node_count: 100,
             split_depth: 0,
             completed: vec![],
@@ -1056,6 +1073,10 @@ mod tests {
         assert!(json.contains("key"));
         assert!(json.contains("level"));
         assert!(json.contains("next_idx"));
+        assert!(!json.contains("primes"));
+        assert!(!json.contains("cols"));
+        assert!(!json.contains("shifts"));
+        assert!(!json.contains("target_shifts"));
         assert!(!json.contains("zero_mask"));
         assert!(!json.contains("base_mask"));
     }
@@ -1080,6 +1101,7 @@ mod tests {
             next_idx: 2,
         }];
         saved.write_checkpoint(&path, 1, &stack).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains('\n'));
 
         let mut resumed = State::new(primes, cols, table);
         resumed
@@ -1132,12 +1154,19 @@ mod tests {
         let depth = 3;
         let table = build_shift_table(&primes, cols);
         let path = unique_checkpoint_path("parallel-checkpoint");
+        let database_path = path.with_extension("db");
 
         let mut state = State::new(primes.clone(), cols, table.clone());
         state.checkpoint_interval = 1;
+        state
+            .set_shift_path_store(&database_path, depth, true)
+            .unwrap();
         let expected = state.search_parallel(depth, Some(&path), None).unwrap();
 
-        let resumed = State::new(primes, cols, table);
+        let mut resumed = State::new(primes, cols, table);
+        resumed
+            .set_shift_path_store(&database_path, depth, false)
+            .unwrap();
         let result = resumed
             .search_parallel(depth, Some(&path), Some(&path))
             .unwrap();
@@ -1149,6 +1178,7 @@ mod tests {
         let backup_path = path.with_extension("bak");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(backup_path);
+        let _ = std::fs::remove_file(database_path);
     }
 
     #[test]
@@ -1157,7 +1187,7 @@ mod tests {
         let cols = 8;
         let depth = 3;
         let table = build_shift_table(&primes, cols);
-        let state = State::new(primes.clone(), cols, table.clone());
+        let mut state = State::new(primes.clone(), cols, table.clone());
         let split_depth = state.parallel_split_depth(depth);
         let work_items = state.parallel_work_items(split_depth);
         assert!(!work_items.is_empty());
@@ -1167,6 +1197,17 @@ mod tests {
             .unwrap();
 
         let path = unique_checkpoint_path("parallel-completed");
+        let database_path = path.with_extension("db");
+        state
+            .set_shift_path_store(&database_path, depth, true)
+            .unwrap();
+        let store = state.shift_path_store.as_ref().unwrap();
+        store
+            .replace_all(expected.max_count, &expected.shifts)
+            .unwrap();
+        for (index, target_shifts) in expected.target_shifts.iter().enumerate() {
+            store.append_target(index + 1, target_shifts).unwrap();
+        }
         let completed: Vec<usize> = (0..work_items.len()).collect();
         state
             .write_checkpoint_file(
@@ -1174,15 +1215,11 @@ mod tests {
                 &super::Checkpoint {
                     mode: super::SearchMode::Parallel,
                     depth,
-                    primes: primes.clone(),
-                    cols,
                     stack: Vec::new(),
                     key: Vec::new(),
                     max_count: expected.max_count,
                     results: expected.results,
-                    shifts: expected.shifts.clone(),
                     target_count: expected.target_count,
-                    target_shifts: expected.target_shifts.clone(),
                     node_count: 42,
                     split_depth,
                     completed,
@@ -1191,7 +1228,10 @@ mod tests {
             )
             .unwrap();
 
-        let resumed = State::new(primes, cols, table);
+        let mut resumed = State::new(primes, cols, table);
+        resumed
+            .set_shift_path_store(&database_path, depth, false)
+            .unwrap();
         let result = resumed
             .search_parallel(depth, Some(&path), Some(&path))
             .unwrap();
@@ -1202,6 +1242,7 @@ mod tests {
         let backup_path = path.with_extension("bak");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(backup_path);
+        let _ = std::fs::remove_file(database_path);
     }
 
     #[test]
@@ -1248,15 +1289,11 @@ mod tests {
                 &super::Checkpoint {
                     mode: super::SearchMode::Parallel,
                     depth,
-                    primes: primes.clone(),
-                    cols,
                     stack: Vec::new(),
                     key: Vec::new(),
                     max_count: 0,
                     results: 0,
-                    shifts: Vec::new(),
                     target_count: 0,
-                    target_shifts: Vec::new(),
                     node_count: 0,
                     split_depth: 1,
                     completed: Vec::new(),

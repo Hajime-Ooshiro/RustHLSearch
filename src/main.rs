@@ -119,26 +119,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 探索中にチェックポイントを書き出すため、他の出力より先に output_dir を用意する
     std::fs::create_dir_all(&cli.output_dir)?;
     let shift_path = cli.output_dir.join("HLSearch.db");
-    state.set_shift_path_store(&shift_path, cli.depth)?;
-
     let checkpoint_path = cli.output_dir.join(CHECKPOINT_FILENAME);
     let backup_path = cli.output_dir.join(CHECKPOINT_BACKUP_FILENAME);
+    let resume_path = if checkpoint_path.exists() {
+        Some(checkpoint_path.as_path())
+    } else {
+        backup_path.exists().then_some(backup_path.as_path())
+    };
+    state.set_shift_path_store(&shift_path, cli.depth, resume_path.is_none())?;
 
     match cli.mode {
         SearchMode::Sequential => {
-            let resume_path = if checkpoint_path.exists() {
-                Some(checkpoint_path.as_path())
-            } else {
-                backup_path.exists().then_some(backup_path.as_path())
-            };
             state.search_with_checkpoint(cli.depth, Some(&checkpoint_path), resume_path)?;
         }
         SearchMode::Parallel => {
-            let resume_path = if checkpoint_path.exists() {
-                Some(checkpoint_path.as_path())
-            } else {
-                backup_path.exists().then_some(backup_path.as_path())
-            };
             let result = state.search_parallel(cli.depth, Some(&checkpoint_path), resume_path)?;
             state.max_count = result.max_count;
             state.results = result.results;

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// 基底行の生成と補集合シフトテーブルの作成
@@ -186,6 +186,7 @@ struct ParallelSearchCtx<'a> {
     node_count: &'a AtomicU64,
     progress: &'a Mutex<ParallelProgress>,
     checkpoint_path: Option<&'a Path>,
+    interrupted: &'a AtomicBool,
     checkpoint_lock: Mutex<()>,
     last_checkpoint_nodes: AtomicU64,
 }
@@ -317,12 +318,30 @@ impl State {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn search_with_checkpoint(
         &mut self,
         depth: usize,
         checkpoint_path: Option<&Path>,
         resume_path: Option<&Path>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let interrupted = AtomicBool::new(false);
+        self.search_with_checkpoint_interruptible(
+            depth,
+            checkpoint_path,
+            resume_path,
+            &interrupted,
+        )?;
+        Ok(())
+    }
+
+    pub fn search_with_checkpoint_interruptible(
+        &mut self,
+        depth: usize,
+        checkpoint_path: Option<&Path>,
+        resume_path: Option<&Path>,
+        interrupted: &AtomicBool,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
         let mut stack = if let Some(path) = resume_path {
             let checkpoint = Self::load_checkpoint(path)?;
             if checkpoint.mode != SearchMode::Sequential {
@@ -355,6 +374,12 @@ impl State {
         let mut checkpoint_due = false;
 
         while !stack.is_empty() {
+            if interrupted.load(Ordering::SeqCst) {
+                if let Some(path) = checkpoint_path {
+                    self.write_checkpoint(path, depth, &stack)?;
+                }
+                return Ok(false);
+            }
             if checkpoint_due {
                 if let Some(path) = checkpoint_path {
                     self.write_checkpoint(path, depth, &stack)?;
@@ -421,7 +446,7 @@ impl State {
         if let Some(path) = checkpoint_path {
             self.write_checkpoint(path, depth, &stack)?;
         }
-        Ok(())
+        Ok(!interrupted.load(Ordering::SeqCst))
     }
 
     fn write_checkpoint(
@@ -517,12 +542,26 @@ impl State {
         masks
     }
 
+    #[cfg(test)]
     pub fn search_parallel(
         &self,
         depth: usize,
         checkpoint_path: Option<&Path>,
         resume_path: Option<&Path>,
     ) -> Result<SharedResults, Box<dyn std::error::Error>> {
+        let interrupted = AtomicBool::new(false);
+        let (results, _) =
+            self.search_parallel_interruptible(depth, checkpoint_path, resume_path, &interrupted)?;
+        Ok(results)
+    }
+
+    pub fn search_parallel_interruptible(
+        &self,
+        depth: usize,
+        checkpoint_path: Option<&Path>,
+        resume_path: Option<&Path>,
+        interrupted: &AtomicBool,
+    ) -> Result<(SharedResults, bool), Box<dyn std::error::Error>> {
         let results = Arc::new(ParallelResults {
             max_count: AtomicUsize::new(0),
             results: Mutex::new(SharedResults::default()),
@@ -591,6 +630,7 @@ impl State {
             node_count: node_count.as_ref(),
             progress: &progress,
             checkpoint_path,
+            interrupted,
             checkpoint_lock: Mutex::new(()),
             last_checkpoint_nodes: AtomicU64::new(node_count.load(Ordering::Relaxed)),
         };
@@ -605,7 +645,7 @@ impl State {
         if ctx.checkpoint_path.is_some() {
             self.write_parallel_checkpoint(&ctx, true, false)?;
         }
-        Ok(results.snapshot())
+        Ok((results.snapshot(), !interrupted.load(Ordering::SeqCst)))
     }
 
     fn parallel_jobs(
@@ -654,6 +694,10 @@ impl State {
         } = job;
         let depth = ctx.depth;
 
+        if ctx.interrupted.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
         let (mut key, mut masks, mut stack) = if let Some((saved_stack, saved_key)) = resume {
             let masks = self.rebuild_masks(depth, &saved_key);
             (saved_key, masks, saved_stack)
@@ -684,6 +728,11 @@ impl State {
         let mut local_nodes = 0_u64;
 
         while let Some(frame) = stack.last_mut() {
+            if ctx.interrupted.load(Ordering::SeqCst) {
+                ctx.node_count.fetch_add(local_nodes, Ordering::Relaxed);
+                self.store_parallel_progress(index, &stack, &key, ctx);
+                return Ok(());
+            }
             if frame.next_idx == 0 {
                 stack.pop();
                 if stack.last().is_some() {
@@ -1009,6 +1058,50 @@ mod tests {
         let mut state = State::new(vec![2], 4, table);
         state.checkpoint_interval = 5_000;
         assert_eq!(state.checkpoint_interval, 5_000);
+    }
+
+    #[test]
+    fn sequential_interruption_writes_a_checkpoint() {
+        use std::sync::atomic::AtomicBool;
+
+        let primes = vec![2, 3];
+        let table = build_shift_table(&primes, 4);
+        let mut state = State::new(primes, 4, table);
+        let path = unique_checkpoint_path("interrupted-sequential");
+        let interrupted = AtomicBool::new(true);
+
+        let completed = state
+            .search_with_checkpoint_interruptible(2, Some(&path), None, &interrupted)
+            .unwrap();
+
+        assert!(!completed);
+        assert!(path.exists());
+
+        let backup_path = path.with_extension("bak");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(backup_path);
+    }
+
+    #[test]
+    fn parallel_interruption_writes_a_checkpoint() {
+        use std::sync::atomic::AtomicBool;
+
+        let primes = vec![2, 3];
+        let table = build_shift_table(&primes, 4);
+        let state = State::new(primes, 4, table);
+        let path = unique_checkpoint_path("interrupted-parallel");
+        let interrupted = AtomicBool::new(true);
+
+        let (_, completed) = state
+            .search_parallel_interruptible(2, Some(&path), None, &interrupted)
+            .unwrap();
+
+        assert!(!completed);
+        assert!(path.exists());
+
+        let backup_path = path.with_extension("bak");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(backup_path);
     }
 
     #[test]

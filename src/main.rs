@@ -14,6 +14,8 @@ use simple_logger::SimpleLogger;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 const CHECKPOINT_FILENAME: &str = "checkpoint.json";
@@ -94,6 +96,13 @@ impl Cli {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     SimpleLogger::new().with_level(LevelFilter::Info).init()?;
     let cli = Cli::parse();
+    let interrupted = Arc::new(AtomicBool::new(false));
+    {
+        let interrupted = Arc::clone(&interrupted);
+        ctrlc::set_handler(move || {
+            interrupted.store(true, Ordering::SeqCst);
+        })?;
+    }
     let all_primes = generate_primes(MAX_PRIME);
 
     if let Err(message) = cli.validate(all_primes.len()) {
@@ -128,18 +137,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     state.set_shift_path_store(&shift_path, cli.depth, resume_path.is_none())?;
 
-    match cli.mode {
-        SearchMode::Sequential => {
-            state.search_with_checkpoint(cli.depth, Some(&checkpoint_path), resume_path)?;
-        }
+    let completed = match cli.mode {
+        SearchMode::Sequential => state.search_with_checkpoint_interruptible(
+            cli.depth,
+            Some(&checkpoint_path),
+            resume_path,
+            &interrupted,
+        )?,
         SearchMode::Parallel => {
-            let result = state.search_parallel(cli.depth, Some(&checkpoint_path), resume_path)?;
+            let (result, completed) = state.search_parallel_interruptible(
+                cli.depth,
+                Some(&checkpoint_path),
+                resume_path,
+                &interrupted,
+            )?;
             state.max_count = result.max_count;
             state.results = result.results;
             state.shifts = result.shifts;
             state.target_count = result.target_count;
             state.target_shifts = result.target_shifts;
+            completed
         }
+    };
+
+    if !completed {
+        info!(
+            "中断要求を受信したためチェックポイントを保存しました: {}",
+            checkpoint_path.display()
+        );
+        return Ok(());
     }
 
     if checkpoint_path.exists() {

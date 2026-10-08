@@ -168,7 +168,9 @@ cargo run --release -- --depth 10 --cols 4000 --output-dir results
   "result": {
     "max_count": 447,
     "results": 1,
-   "shifts": [[1, 1, 4, 3, 5, 10, 1, 9]]
+    "shifts": [[1, 1, 4, 3, 5, 10, 1, 9]],
+    "target_count": 0,
+    "target_shifts": []
   }
 }
 ```
@@ -177,6 +179,8 @@ cargo run --release -- --depth 10 --cols 4000 --output-dir results
 - `result.max_count`: 全探索で到達した葉ノードの最大 popcount
 - `result.results`: `max_count` に一致するパスの個数
 - `result.shifts`: `max_count` に一致するシフト列の配列
+- `result.target_count`: 深さ 249 で popcount がターゲット値 447 に一致したパスの個数
+- `result.target_shifts`: 上記のシフト列の配列
 
 ## ライセンス
 

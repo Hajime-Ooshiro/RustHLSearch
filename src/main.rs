@@ -37,6 +37,8 @@ struct OutputConfig<'a> {
 struct OutputResult {
     max_count: usize,
     results: usize,
+    target_count: usize,
+    target_shifts: Vec<Vec<usize>>,
 }
 
 #[derive(Parser, Debug)]
@@ -137,11 +139,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 backup_path.exists().then_some(backup_path.as_path())
             };
-            let result =
-                state.search_parallel(cli.depth, Some(&checkpoint_path), resume_path)?;
+            let result = state.search_parallel(cli.depth, Some(&checkpoint_path), resume_path)?;
             state.max_count = result.max_count;
             state.results = result.results;
             state.shifts = result.shifts;
+            state.target_count = result.target_count;
+            state.target_shifts = result.target_shifts;
         }
     }
 
@@ -150,13 +153,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if backup_path.exists() {
             std::fs::remove_file(&backup_path)?;
         }
-        info!("探索完了のためチェックポイントを削除: {}", checkpoint_path.display());
+        info!(
+            "探索完了のためチェックポイントを削除: {}",
+            checkpoint_path.display()
+        );
     }
 
     let elapsed = start_time.elapsed();
     info!("探索時間: {:?}", elapsed);
     info!("最大値: {}", state.max_count);
     info!("該当件数: {}", state.results);
+    info!("ターゲット一致件数: {}", state.target_count);
 
     info!("シフトパスSQLite出力ファイル: {}", shift_path.display());
 
@@ -178,6 +185,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         result: OutputResult {
             max_count: state.max_count,
             results: state.results,
+            target_count: state.target_count,
+            target_shifts: state.target_shifts,
         },
     };
     serde_json::to_writer_pretty(&mut result_writer, &output)?;

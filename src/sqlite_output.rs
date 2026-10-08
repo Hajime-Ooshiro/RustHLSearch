@@ -127,10 +127,7 @@ mod tests {
             .collect();
         assert_eq!(
             rows,
-            vec![
-                (2, 11, "[3,4]".to_string()),
-                (2, 11, "[5,6]".to_string())
-            ]
+            vec![(2, 11, "[3,4]".to_string()), (2, 11, "[5,6]".to_string())]
         );
 
         drop(connection);

@@ -393,11 +393,12 @@ impl State {
 
             if self.node_count.is_multiple_of(self.checkpoint_interval) {
                 info!(
-                    "探索経過: nodes={} best={} hits={} depth={}",
+                    "探索経過: n={} h={} d={} k={:?}",
                     self.node_count,
-                    self.max_count,
+                    # self.max_count,
                     self.results,
-                    self.key.len()
+                    self.key.len(),
+                    self.key,
                 );
                 checkpoint_due = true;
             }
@@ -742,9 +743,9 @@ impl State {
                 local_nodes = 0;
                 let shared = ctx.results.snapshot();
                 info!(
-                    "探索経過: nodes={} best={} hits={} depth={} key={:?}",
+                    "探索経過: n={} h={} d={} k={:?}",
                     n,
-                    shared.max_count,
+                    # shared.max_count,
                     shared.results,
                     key.len(),
                     key

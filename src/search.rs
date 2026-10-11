@@ -117,15 +117,6 @@ impl ParallelResults {
             if count < current {
                 return Ok(());
             }
-            // if count < self.target {
-            //     info!(
-            //         "target break (depth={} count={}, key={:?})",
-            //         key.len(),
-            //         count,
-            //         key
-            //     );
-            //     return Ok(());
-            // }
             if count == current {
                 let mut results = self.results.lock().unwrap();
                 if self.max_count.load(Ordering::Relaxed) == count
@@ -134,8 +125,10 @@ impl ParallelResults {
                         .iter()
                         .any(|existing| existing.as_slice() == key)
                 {
-                    if let Some(store) = &self.shift_path_store {
-                        store.append(count, key)?;
+                    if results.results <= 500 {
+                        if let Some(store) = &self.shift_path_store {
+                            store.append(count, key)?;
+                        }
                     }
                     results.results += 1;
                     results.shifts.push(key.to_vec());
@@ -272,15 +265,6 @@ impl State {
     }
 
     fn aggregate_leaf_result(&mut self, count: usize, key: &[usize]) -> Result<(), String> {
-        // if count < self.target {
-        //     info!(
-        //         "target break (depth={} count={}, key={:?})",
-        //         self.key.len(),
-        //         count,
-        //         key
-        //     );
-        //     return Ok(());
-        // }
         if count > self.max_count {
             if let Some(store) = &self.shift_path_store {
                 store.replace_all(count, &[key.to_vec()])?;
@@ -289,10 +273,12 @@ impl State {
             self.results = 1;
             self.shifts.clear();
             self.shifts.push(key.to_vec());
-            info!("best level={} key={:?} count={}", key.len() - 1, key, count);
+            // info!("best level={} key={:?} count={}", key.len() - 1, key, count);
         } else if count == self.max_count {
-            if let Some(store) = &self.shift_path_store {
-                store.append(count, key)?;
+            if self.results <= 500 {
+                if let Some(store) = &self.shift_path_store {
+                    store.append(count, key)?;
+                }
             }
             self.results += 1;
             self.shifts.push(key.to_vec());
@@ -406,26 +392,20 @@ impl State {
                 node_masks[0].bitand_into_count(&base_masks[level], &self.shift_table[level][i]);
 
             if self.node_count.is_multiple_of(self.checkpoint_interval) {
-                // info!(
-                //     "探索経過: nodes={} best={} hits={} depth={}",
-                //     self.node_count,
-                //     self.max_count,
-                //     self.results,
-                //     self.key.len()
-                // );
+                info!(
+                    "探索経過: nodes={} best={} hits={} depth={}",
+                    self.node_count,
+                    self.max_count,
+                    self.results,
+                    self.key.len()
+                );
                 checkpoint_due = true;
             }
 
-            // if count < self.target {
-            //     info!(
-            //         "target break (depth={} count={}, key={:?})",
-            //         self.key.len(),
-            //         count,
-            //         self.key
-            //     );
-            //     self.key.pop();
-            //     continue;
-            // }
+            if count < self.target {
+                self.key.pop();
+                continue;
+            }
 
             if level + 1 >= depth {
                 let key = self.key.clone();
@@ -707,8 +687,10 @@ impl State {
             let key = work_item.key;
             if ctx.split_depth == depth {
                 let count = masks[ctx.split_depth].count_ones();
-                ctx.results.record_target(depth, count, &key)?;
-                ctx.results.record_best(count, &key)?;
+                if count >= self.target {
+                    ctx.results.record_target(depth, count, &key)?;
+                    ctx.results.record_best(count, &key)?;
+                }
                 self.finish_parallel_job(index, ctx)?;
                 return Ok(());
             }
@@ -720,6 +702,11 @@ impl State {
         };
 
         if ctx.split_depth == depth {
+            self.finish_parallel_job(index, ctx)?;
+            return Ok(());
+        }
+
+        if masks[key.len()].count_ones() < self.target {
             self.finish_parallel_job(index, ctx)?;
             return Ok(());
         }
@@ -766,16 +753,10 @@ impl State {
                 self.write_parallel_checkpoint(ctx, false, true)?;
             }
 
-            // if c_count < self.target {
-            //     info!(
-            //         "target break (depth={}, count={}, key={:?})",
-            //         key.len(),
-            //         c_count,
-            //         key
-            //     );
-            //     key.pop();
-            //     continue;
-            // }
+            if c_count < self.target {
+                key.pop();
+                continue;
+            }
 
             if level + 1 >= depth {
                 ctx.results.record_target(depth, c_count, &key)?;
@@ -1023,19 +1004,22 @@ mod tests {
     }
 
     #[test]
-    fn target_defaults_to_447_without_pruning_smaller_counts() {
-        let primes = vec![2];
+    fn target_prunes_smaller_counts() {
+        let primes = vec![2, 3];
         let cols = 4;
         let table = build_shift_table(&primes, cols);
         let mut sequential = State::new(primes.clone(), cols, table.clone());
         assert_eq!(sequential.target, 447);
+        sequential.target = 3;
 
-        sequential.search_with_checkpoint(1, None, None).unwrap();
-        assert!(sequential.results > 0);
+        sequential.search_with_checkpoint(2, None, None).unwrap();
+        assert_eq!(sequential.results, 0);
+        assert_eq!(sequential.node_count, 2);
 
-        let parallel = State::new(primes, cols, table);
+        let mut parallel = State::new(primes, cols, table);
+        parallel.target = 3;
         let result = parallel.search_parallel(1, None, None).unwrap();
-        assert!(result.results > 0);
+        assert_eq!(result.results, 0);
     }
 
     #[test]

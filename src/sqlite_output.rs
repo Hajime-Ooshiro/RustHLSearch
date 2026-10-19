@@ -66,32 +66,6 @@ impl ShiftPathStore {
         })
     }
 
-    pub fn replace_all(&self, max_count: usize, paths: &[Vec<usize>]) -> Result<(), String> {
-        let mut connection = self
-            .connection
-            .lock()
-            .map_err(|_| "SQLite 出力のロック取得に失敗しました".to_string())?;
-        let transaction = connection
-            .transaction()
-            .map_err(|error| error.to_string())?;
-        transaction
-            .execute(
-                "DELETE FROM shift_paths WHERE depth = ?1",
-                params![self.depth],
-            )
-            .map_err(|error| error.to_string())?;
-        for path in paths {
-            let shifts = serde_json::to_string(path).map_err(|error| error.to_string())?;
-            transaction
-                .execute(
-                    "INSERT INTO shift_paths (depth, max_count, shifts) VALUES (?1, ?2, ?3)",
-                    params![self.depth, max_count, shifts],
-                )
-                .map_err(|error| error.to_string())?;
-        }
-        transaction.commit().map_err(|error| error.to_string())
-    }
-
     pub fn append(&self, max_count: usize, path: &[usize]) -> Result<(), String> {
         let shifts = serde_json::to_string(path).map_err(|error| error.to_string())?;
         let connection = self
@@ -100,7 +74,7 @@ impl ShiftPathStore {
             .map_err(|_| "SQLite 出力のロック取得に失敗しました".to_string())?;
         connection
             .execute(
-                "INSERT INTO shift_paths (depth, max_count, shifts) VALUES (?1, ?2, ?3)",
+                "INSERT OR IGNORE INTO shift_paths (depth, max_count, shifts) VALUES (?1, ?2, ?3)",
                 params![self.depth, max_count, shifts],
             )
             .map_err(|error| error.to_string())?;
@@ -122,8 +96,30 @@ impl ShiftPathStore {
         Ok(())
     }
 
-    pub fn load_paths(&self) -> Result<Vec<Vec<usize>>, String> {
-        self.load_path_column("shift_paths", "shifts", "rowid")
+    pub fn load_result_paths(&self, max_count: usize) -> Result<Vec<Vec<usize>>, String> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "SQLite 出力のロック取得に失敗しました".to_string())?;
+        let mut statement = connection
+            .prepare(
+                "SELECT shifts FROM shift_paths WHERE depth = ?1 AND max_count = ?2 ORDER BY rowid",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![self.depth, max_count], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| error.to_string())?;
+        let mut paths = Vec::new();
+        for row in rows {
+            let path: Vec<usize> = serde_json::from_str(&row.map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?;
+            if path.len() == self.depth {
+                paths.push(path);
+            }
+        }
+        Ok(paths)
     }
 
     pub fn load_target_paths(&self) -> Result<Vec<Vec<usize>>, String> {
@@ -182,7 +178,7 @@ mod tests {
     use super::ShiftPathStore;
 
     #[test]
-    fn replaces_old_paths_and_appends_equal_best_paths() {
+    fn appends_paths_without_duplicate_rows() {
         let path = std::env::temp_dir().join(format!(
             "hlsearch-shift-paths-{}-{}.sqlite",
             std::process::id(),
@@ -194,7 +190,8 @@ mod tests {
         let store = ShiftPathStore::create(&path, 2, true).unwrap();
 
         store.append(10, &[1, 2]).unwrap();
-        store.replace_all(11, &[vec![3, 4]]).unwrap();
+        store.append(11, &[3, 4]).unwrap();
+        store.append(11, &[5, 6]).unwrap();
         store.append(11, &[5, 6]).unwrap();
         store.append_target(1, &[3, 4]).unwrap();
         store.append_target(2, &[5, 6]).unwrap();
@@ -209,7 +206,11 @@ mod tests {
             .collect();
         assert_eq!(
             rows,
-            vec![(2, 11, "[3,4]".to_string()), (2, 11, "[5,6]".to_string())]
+            vec![
+                (2, 10, "[1,2]".to_string()),
+                (2, 11, "[3,4]".to_string()),
+                (2, 11, "[5,6]".to_string())
+            ]
         );
         let target_rows: Vec<(usize, usize, String)> = connection
             .prepare(

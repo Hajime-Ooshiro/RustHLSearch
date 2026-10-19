@@ -153,7 +153,7 @@ cargo run --release -- --depth 10 --cols 4000 --output-dir results
 
 ## 出力ファイル形式
 
-出力ファイルは、シフトパスを `HLSearch.db`、探索結果を `result_depth8_YYYYMMDD_HHMMSS.txt` の形式で出力します。最大 popcount のシフトパスは探索中に SQLite の `shift_paths` テーブルへ逐次保存されます。テーブルの主キーは `(depth, shifts)` で、実行開始時には対象深さの既存パスだけが初期化されます。より大きい最大 popcount が見つかると、同じ深さの以前のパスは置き換えられます。深さ 249 でターゲット値 447 に一致したパスは、発見ごとに `target_paths` テーブルへ `(depth, target_count, target_shifts)` として追加されます。`target_paths` の主キーは `(depth, target_shifts)` です。
+出力ファイルは、シフトパスを `HLSearch.db`、探索結果を `result_depth8_YYYYMMDD_HHMMSS.txt` の形式で出力します。ターゲット値による枝刈りを通過した各シフトパスは、探索中に SQLite の `shift_paths` テーブルへ逐次保存されます。`max_count` 列には、そのパス時点の popcount を保存します。テーブルの主キーは `(depth, shifts)` で、実行開始時には対象深さの既存パスだけが初期化されます。チェックポイントの再開時には、探索深さと最終最大 popcount が一致する葉パスだけをこのテーブルから復元します。深さ 249 でターゲット値 447 に一致したパスは、発見ごとに `target_paths` テーブルへ `(depth, target_count, target_shifts)` として追加されます。`target_paths` の主キーは `(depth, target_shifts)` です。
 
 ファイルには実行時設定（`config`）と探索結果（`result`）を含むJSONオブジェクトが出力されます。
 

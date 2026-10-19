@@ -119,9 +119,6 @@ impl ParallelResults {
             return Ok(());
         }
         if count > current {
-            if let Some(store) = &self.shift_path_store {
-                store.replace_all(count, &[key.to_vec()])?;
-            }
             self.max_count.store(count, Ordering::Relaxed);
             results.results = 1;
             results.shifts.clear();
@@ -134,9 +131,6 @@ impl ParallelResults {
             .iter()
             .any(|existing| existing.as_slice() == key)
         {
-            if let Some(store) = &self.shift_path_store {
-                store.append(count, key)?;
-            }
             results.results += 1;
             results.shifts.push(key.to_vec());
         }
@@ -228,6 +222,7 @@ impl State {
 
     fn load_checkpoint_paths(
         &self,
+        expected_max_count: usize,
         expected_results: usize,
         expected_target_count: usize,
     ) -> Result<(ShiftPaths, ShiftPaths), String> {
@@ -239,7 +234,11 @@ impl State {
                 "チェックポイントの結果パスを復元するための SQLite 出力がありません".to_string(),
             );
         };
-        let shifts = store.load_paths()?;
+        let shifts = if expected_results == 0 {
+            Vec::new()
+        } else {
+            store.load_result_paths(expected_max_count)?
+        };
         let target_shifts = store.load_target_paths()?;
         if shifts.len() != expected_results || target_shifts.len() != expected_target_count {
             return Err(format!(
@@ -264,12 +263,9 @@ impl State {
             return Ok(());
         }
         if count > self.max_count {
-            if let Some(store) = &self.shift_path_store {
-                store.replace_all(count, &[key.to_vec()])?;
-            }
             self.max_count = count;
             self.results = 1;
-            // self.shifts.clear();
+            self.shifts.clear();
             self.shifts.push(key.to_vec());
             info!(
                 "score level={} key={:?} count={}",
@@ -278,9 +274,6 @@ impl State {
                 count
             );
         } else if count == self.max_count {
-            if let Some(store) = &self.shift_path_store {
-                store.append(count, key)?;
-            }
             self.results += 1;
             self.shifts.push(key.to_vec());
             debug!(
@@ -347,7 +340,11 @@ impl State {
             self.results = checkpoint.results;
             self.target_count = checkpoint.target_count;
             (self.shifts, self.target_shifts) = self
-                .load_checkpoint_paths(checkpoint.results, checkpoint.target_count)
+                .load_checkpoint_paths(
+                    checkpoint.max_count,
+                    checkpoint.results,
+                    checkpoint.target_count,
+                )
                 .map_err(std::io::Error::other)?;
             self.node_count = checkpoint.node_count;
             info!(
@@ -417,6 +414,12 @@ impl State {
                 );
                 self.key.pop();
                 continue;
+            }
+
+            if let Some(store) = &self.shift_path_store {
+                store
+                    .append(count, &self.key)
+                    .map_err(std::io::Error::other)?;
             }
 
             if level + 1 >= depth {
@@ -584,7 +587,11 @@ impl State {
                 .max_count
                 .store(checkpoint.max_count, Ordering::Relaxed);
             let (shifts, target_shifts) = self
-                .load_checkpoint_paths(checkpoint.results, checkpoint.target_count)
+                .load_checkpoint_paths(
+                    checkpoint.max_count,
+                    checkpoint.results,
+                    checkpoint.target_count,
+                )
                 .map_err(std::io::Error::other)?;
             *results.results.lock().unwrap() = SharedResults {
                 max_count: checkpoint.max_count,
@@ -609,7 +616,7 @@ impl State {
             );
         }
 
-        let work_items = self.parallel_work_items(split_depth);
+        let work_items = self.parallel_work_items(split_depth)?;
         let jobs = {
             let progress = progress.lock().unwrap();
             self.parallel_jobs(&work_items, &progress)?
@@ -701,6 +708,9 @@ impl State {
                 let count = masks[ctx.split_depth].count_ones();
                 if count < self.target {
                 } else {
+                    if let Some(store) = &ctx.results.shift_path_store {
+                        store.append(count, &key)?;
+                    }
                     ctx.results.record_target(depth, count, &key)?;
                     ctx.results.record_path(count, &key)?;
                 }
@@ -770,6 +780,10 @@ impl State {
                 );
                 key.pop();
                 continue;
+            }
+
+            if let Some(store) = &ctx.results.shift_path_store {
+                store.append(c_count, &key)?;
             }
 
             if level + 1 >= depth {
@@ -889,7 +903,7 @@ impl State {
         depth
     }
 
-    fn parallel_work_items(&self, split_depth: usize) -> Vec<WorkItem> {
+    fn parallel_work_items(&self, split_depth: usize) -> Result<Vec<WorkItem>, String> {
         let mut work_items = vec![WorkItem {
             key: Vec::with_capacity(split_depth),
             base_mask: self.zero_mask.clone(),
@@ -900,17 +914,23 @@ impl State {
             for item in work_items {
                 for shift in (0..self.primes[level]).rev() {
                     let mut base_mask = self.zero_mask.clone();
-                    let _ = base_mask
+                    let count = base_mask
                         .bitand_into_count(&item.base_mask, &self.shift_table[level][shift]);
                     let mut key = item.key.clone();
                     key.push(shift);
+                    if count < self.target {
+                        continue;
+                    }
+                    if let Some(store) = &self.shift_path_store {
+                        store.append(count, &key)?;
+                    }
                     next_items.push(WorkItem { key, base_mask });
                 }
             }
             work_items = next_items;
         }
 
-        work_items
+        Ok(work_items)
     }
 }
 
@@ -995,8 +1015,8 @@ mod tests {
     }
 
     #[test]
-    fn sequential_search_writes_best_paths_to_sqlite() {
-        let primes = vec![2];
+    fn sequential_search_writes_each_unpruned_path_to_sqlite() {
+        let primes = vec![2, 3];
         let cols = 4;
         let table = build_shift_table(&primes, cols);
         let path = std::env::temp_dir().join(format!(
@@ -1009,21 +1029,25 @@ mod tests {
         ));
         let mut state = State::new(primes, cols, table);
         state.target = 0;
-        state.set_shift_path_store(&path, 1, true).unwrap();
+        state.set_shift_path_store(&path, 2, true).unwrap();
 
-        state.search_with_checkpoint(1, None, None).unwrap();
+        state.search_with_checkpoint(2, None, None).unwrap();
 
         let connection = rusqlite::Connection::open(&path).unwrap();
-        let rows: Vec<(usize, usize, String)> = connection
-            .prepare("SELECT depth, max_count, shifts FROM shift_paths ORDER BY shifts DESC")
+        let rows: Vec<(usize, String)> = connection
+            .prepare("SELECT max_count, shifts FROM shift_paths ORDER BY rowid")
             .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
             .unwrap()
             .map(Result::unwrap)
             .collect();
+        assert_eq!(rows.len(), 8);
+        assert_eq!(rows.iter().filter(|(_, path)| path == "[1]").count(), 1);
         assert_eq!(
-            rows,
-            vec![(1, 2, "[1]".to_string()), (1, 2, "[0]".to_string())]
+            rows.iter()
+                .filter(|(_, path)| serde_json::from_str::<Vec<usize>>(path).unwrap().len() == 2)
+                .count(),
+            6
         );
 
         drop(connection);
@@ -1297,13 +1321,14 @@ mod tests {
         let depth = 3;
         let table = build_shift_table(&primes, cols);
         let mut state = State::new(primes.clone(), cols, table.clone());
+        state.target = 0;
         let split_depth = state.parallel_split_depth(depth);
-        let work_items = state.parallel_work_items(split_depth);
+        let work_items = state.parallel_work_items(split_depth).unwrap();
         assert!(!work_items.is_empty());
 
-        let expected = State::new(primes.clone(), cols, table.clone())
-            .search_parallel(depth, None, None)
-            .unwrap();
+        let mut expected_state = State::new(primes.clone(), cols, table.clone());
+        expected_state.target = 0;
+        let expected = expected_state.search_parallel(depth, None, None).unwrap();
 
         let path = unique_checkpoint_path("parallel-completed");
         let database_path = path.with_extension("db");
@@ -1311,9 +1336,9 @@ mod tests {
             .set_shift_path_store(&database_path, depth, true)
             .unwrap();
         let store = state.shift_path_store.as_ref().unwrap();
-        store
-            .replace_all(expected.max_count, &expected.shifts)
-            .unwrap();
+        for shifts in &expected.shifts {
+            store.append(expected.max_count, shifts).unwrap();
+        }
         for (index, target_shifts) in expected.target_shifts.iter().enumerate() {
             store.append_target(index + 1, target_shifts).unwrap();
         }

@@ -17,14 +17,8 @@ pub fn build_shift_table(primes: &[usize], cols: usize) -> Vec<Vec<BitMask>> {
         let mut complement_shifts = Vec::with_capacity(p);
         for k in 0..p {
             let mut mask = BitMask::new_ones(cols);
-            for col in 0..cols {
-                let idx = col + 1;
-                if col >= k {
-                    let orig_idx = idx - k;
-                    if orig_idx % p == 1 {
-                        mask.set(col, false);
-                    }
-                }
+            for col in (k..cols).step_by(p) {
+                mask.set(col, false);
             }
             complement_shifts.push(mask);
         }
@@ -111,54 +105,42 @@ impl ParallelResults {
         Ok(())
     }
 
-    fn record_best(&self, count: usize, key: &[usize]) -> Result<(), String> {
-        loop {
-            let current = self.max_count.load(Ordering::Relaxed);
-            if count < current {
-                return Ok(());
-            }
-            // if count < self.target {
-            //     info!(
-            //         "target break (depth={} count={}, key={:?})",
-            //         key.len(),
-            //         count,
-            //         key
-            //     );
-            //     return Ok(());
-            // }
-            if count == current {
-                let mut results = self.results.lock().unwrap();
-                if self.max_count.load(Ordering::Relaxed) == count
-                    && !results
-                        .shifts
-                        .iter()
-                        .any(|existing| existing.as_slice() == key)
-                {
-                    if let Some(store) = &self.shift_path_store {
-                        store.append(count, key)?;
-                    }
-                    results.results += 1;
-                    results.shifts.push(key.to_vec());
-                }
-                return Ok(());
-            }
-            if self
-                .max_count
-                .compare_exchange_weak(current, count, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                let mut results = self.results.lock().unwrap();
-                if self.max_count.load(Ordering::Relaxed) == count {
-                    if let Some(store) = &self.shift_path_store {
-                        store.replace_all(count, &[key.to_vec()])?;
-                    }
-                    results.results = 1;
-                    results.shifts.clear();
-                    results.shifts.push(key.to_vec());
-                }
-                return Ok(());
-            }
+    fn record_path(&self, count: usize, key: &[usize]) -> Result<(), String> {
+        if count < self.target {
+            return Ok(());
         }
+        if count < self.max_count.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        let mut results = self.results.lock().unwrap();
+        let current = self.max_count.load(Ordering::Relaxed);
+        if count < current {
+            return Ok(());
+        }
+        if count > current {
+            if let Some(store) = &self.shift_path_store {
+                store.replace_all(count, &[key.to_vec()])?;
+            }
+            self.max_count.store(count, Ordering::Relaxed);
+            results.results = 1;
+            results.shifts.clear();
+            results.shifts.push(key.to_vec());
+            return Ok(());
+        }
+
+        if !results
+            .shifts
+            .iter()
+            .any(|existing| existing.as_slice() == key)
+        {
+            if let Some(store) = &self.shift_path_store {
+                store.append(count, key)?;
+            }
+            results.results += 1;
+            results.shifts.push(key.to_vec());
+        }
+        Ok(())
     }
 
     fn snapshot(&self) -> SharedResults {
@@ -272,31 +254,41 @@ impl State {
     }
 
     fn aggregate_leaf_result(&mut self, count: usize, key: &[usize]) -> Result<(), String> {
-        // if count < self.target {
-        //     info!(
-        //         "target break (depth={} count={}, key={:?})",
-        //         self.key.len(),
-        //         count,
-        //         key
-        //     );
-        //     return Ok(());
-        // }
+        if count < self.target {
+            info!(
+                "target break (depth={} count={}, key={:?})",
+                self.key.len(),
+                count,
+                key
+            );
+            return Ok(());
+        }
         if count > self.max_count {
             if let Some(store) = &self.shift_path_store {
                 store.replace_all(count, &[key.to_vec()])?;
             }
             self.max_count = count;
             self.results = 1;
-            self.shifts.clear();
+            // self.shifts.clear();
             self.shifts.push(key.to_vec());
-            info!("best level={} key={:?} count={}", key.len() - 1, key, count);
+            info!(
+                "score level={} key={:?} count={}",
+                key.len() - 1,
+                key,
+                count
+            );
         } else if count == self.max_count {
             if let Some(store) = &self.shift_path_store {
                 store.append(count, key)?;
             }
             self.results += 1;
             self.shifts.push(key.to_vec());
-            debug!("best level={} key={:?} count={}", key.len() - 1, key, count);
+            debug!(
+                "score level={} key={:?} count={}",
+                key.len() - 1,
+                key,
+                count
+            );
         }
         Ok(())
     }
@@ -406,26 +398,26 @@ impl State {
                 node_masks[0].bitand_into_count(&base_masks[level], &self.shift_table[level][i]);
 
             if self.node_count.is_multiple_of(self.checkpoint_interval) {
-                // info!(
-                //     "探索経過: nodes={} best={} hits={} depth={}",
-                //     self.node_count,
-                //     self.max_count,
-                //     self.results,
-                //     self.key.len()
-                // );
+                info!(
+                    "探索経過: nodes={} best={} hits={} depth={}",
+                    self.node_count,
+                    self.max_count,
+                    self.results,
+                    self.key.len()
+                );
                 checkpoint_due = true;
             }
 
-            // if count < self.target {
-            //     info!(
-            //         "target break (depth={} count={}, key={:?})",
-            //         self.key.len(),
-            //         count,
-            //         self.key
-            //     );
-            //     self.key.pop();
-            //     continue;
-            // }
+            if count < self.target {
+                info!(
+                    "target break (depth={} count={}, key={:?})",
+                    self.key.len(),
+                    count,
+                    self.key
+                );
+                self.key.pop();
+                continue;
+            }
 
             if level + 1 >= depth {
                 let key = self.key.clone();
@@ -707,8 +699,11 @@ impl State {
             let key = work_item.key;
             if ctx.split_depth == depth {
                 let count = masks[ctx.split_depth].count_ones();
-                ctx.results.record_target(depth, count, &key)?;
-                ctx.results.record_best(count, &key)?;
+                if count < self.target {
+                } else {
+                    ctx.results.record_target(depth, count, &key)?;
+                    ctx.results.record_path(count, &key)?;
+                }
                 self.finish_parallel_job(index, ctx)?;
                 return Ok(());
             }
@@ -766,20 +761,20 @@ impl State {
                 self.write_parallel_checkpoint(ctx, false, true)?;
             }
 
-            // if c_count < self.target {
-            //     info!(
-            //         "target break (depth={}, count={}, key={:?})",
-            //         key.len(),
-            //         c_count,
-            //         key
-            //     );
-            //     key.pop();
-            //     continue;
-            // }
+            if c_count < self.target {
+                info!(
+                    "target break (depth={}, count={}, key={:?})",
+                    key.len(),
+                    c_count,
+                    key
+                );
+                key.pop();
+                continue;
+            }
 
             if level + 1 >= depth {
                 ctx.results.record_target(depth, c_count, &key)?;
-                ctx.results.record_best(c_count, &key)?;
+                ctx.results.record_path(c_count, &key)?;
                 key.pop();
                 continue;
             }
@@ -921,7 +916,9 @@ impl State {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_shift_table, State};
+    use super::{build_shift_table, ParallelResults, State};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Mutex;
 
     #[test]
     fn build_shift_table_creates_expected_complement_masks() {
@@ -930,6 +927,25 @@ mod tests {
         assert_eq!(table[0].len(), 2);
         assert_eq!(table[0][0].count_ones(), 3);
         assert_eq!(table[0][1].count_ones(), 3);
+    }
+
+    #[test]
+    fn parallel_results_keep_only_paths_at_the_current_maximum() {
+        let results = ParallelResults {
+            max_count: AtomicUsize::new(0),
+            results: Mutex::new(Default::default()),
+            target: 0,
+            shift_path_store: None,
+        };
+
+        results.record_path(1, &[0]).unwrap();
+        results.record_path(2, &[1]).unwrap();
+        results.record_path(2, &[2]).unwrap();
+
+        let snapshot = results.snapshot();
+        assert_eq!(snapshot.max_count, 2);
+        assert_eq!(snapshot.results, 2);
+        assert_eq!(snapshot.shifts, vec![vec![1], vec![2]]);
     }
 
     #[test]
@@ -1023,7 +1039,7 @@ mod tests {
     }
 
     #[test]
-    fn target_defaults_to_447_without_pruning_smaller_counts() {
+    fn target_defaults_to_447_and_prunes_smaller_counts() {
         let primes = vec![2];
         let cols = 4;
         let table = build_shift_table(&primes, cols);
@@ -1031,11 +1047,11 @@ mod tests {
         assert_eq!(sequential.target, 447);
 
         sequential.search_with_checkpoint(1, None, None).unwrap();
-        assert!(sequential.results > 0);
+        assert_eq!(sequential.results, 0);
 
         let parallel = State::new(primes, cols, table);
         let result = parallel.search_parallel(1, None, None).unwrap();
-        assert!(result.results > 0);
+        assert_eq!(result.results, 0);
     }
 
     #[test]

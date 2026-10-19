@@ -224,6 +224,14 @@ mod tests {
             target_rows,
             vec![(2, 1, "[3,4]".to_string()), (2, 2, "[5,6]".to_string())]
         );
+        let pruned_table_count: usize = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'pruned_paths'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pruned_table_count, 0);
 
         drop(connection);
         drop(store);

@@ -37,7 +37,7 @@ struct OutputConfig<'a> {
 
 #[derive(Serialize)]
 struct OutputResult {
-    max_count: usize,
+    max_score: usize,
     results: usize,
     target_count: usize,
     target_shifts: Vec<Vec<usize>>,
@@ -151,7 +151,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 resume_path,
                 &interrupted,
             )?;
-            state.max_score = result.max_count;
+            state.max_score = result.max_score;
             state.results = result.results;
             state.shifts = result.shifts;
             state.target_count = result.target_count;
@@ -203,7 +203,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             elapsed: format!("{elapsed:?}"),
         },
         result: OutputResult {
-            max_count: state.max_score,
+            max_score: state.max_score,
             results: state.results,
             target_count: state.target_count,
             target_shifts: state.target_shifts,

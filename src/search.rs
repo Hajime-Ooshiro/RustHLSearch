@@ -897,9 +897,8 @@ impl State {
                     key.len(),
                 );
                 info!(
-                    "探索経過: n={} h={} d={} k={:?}",
+                    "探索経過: nodes={} hit={} depth={} key={:?}",
                     n,
-                    shared.max_score,
                     shared.results,
                     key.len(),
                     key

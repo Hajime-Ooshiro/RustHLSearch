@@ -1,5 +1,6 @@
 use crate::bitmask::BitMask;
 use crate::sqlite_output::ShiftPathStore;
+use indicatif::{HumanCount, ProgressBar};
 use log::{debug, info};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -17,14 +18,8 @@ pub fn build_shift_table(primes: &[usize], cols: usize) -> Vec<Vec<BitMask>> {
         let mut complement_shifts = Vec::with_capacity(p);
         for k in 0..p {
             let mut mask = BitMask::new_ones(cols);
-            for col in 0..cols {
-                let idx = col + 1;
-                if col >= k {
-                    let orig_idx = idx - k;
-                    if orig_idx % p == 1 {
-                        mask.set(col, false);
-                    }
-                }
+            for col in (k..cols).step_by(p) {
+                mask.set(col, false);
             }
             complement_shifts.push(mask);
         }
@@ -60,7 +55,7 @@ struct Checkpoint {
     depth: usize,
     stack: Vec<Frame>,
     key: Vec<usize>,
-    max_count: usize,
+    max_score: usize,
     results: usize,
     #[serde(default)]
     target_count: usize,
@@ -71,6 +66,8 @@ struct Checkpoint {
     completed: Vec<usize>,
     #[serde(default)]
     in_progress: Vec<ParallelInProgress>,
+    #[serde(default)]
+    pending_prefixes: ShiftPaths,
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, clap::ValueEnum, Deserialize, Serialize)]
@@ -83,7 +80,7 @@ pub enum SearchMode {
 
 #[derive(Clone, Debug, Default)]
 pub struct SharedResults {
-    pub max_count: usize,
+    pub max_score: usize,
     pub results: usize,
     pub shifts: Vec<Vec<usize>>,
     pub target_count: usize,
@@ -91,15 +88,15 @@ pub struct SharedResults {
 }
 
 struct ParallelResults {
-    max_count: AtomicUsize,
+    max_score: AtomicUsize,
     results: Mutex<SharedResults>,
     target: usize,
     shift_path_store: Option<ShiftPathStore>,
 }
 
 impl ParallelResults {
-    fn record_target(&self, depth: usize, count: usize, key: &[usize]) -> Result<(), String> {
-        if depth == 249 && count == self.target {
+    fn record_target(&self, depth: usize, score: usize, key: &[usize]) -> Result<(), String> {
+        if depth == 249 && score == self.target {
             let mut results = self.results.lock().unwrap();
             let target_count = results.target_count + 1;
             if let Some(store) = &self.shift_path_store {
@@ -111,52 +108,41 @@ impl ParallelResults {
         Ok(())
     }
 
-    fn record_best(&self, count: usize, key: &[usize]) -> Result<(), String> {
-        loop {
-            let current = self.max_count.load(Ordering::Relaxed);
-            if count < current {
-                return Ok(());
-            }
-            if count == current {
-                let mut results = self.results.lock().unwrap();
-                if self.max_count.load(Ordering::Relaxed) == count
-                    && !results
-                        .shifts
-                        .iter()
-                        .any(|existing| existing.as_slice() == key)
-                {
-                    if results.results <= 500 {
-                        if let Some(store) = &self.shift_path_store {
-                            store.append(count, key)?;
-                        }
-                    }
-                    results.results += 1;
-                    results.shifts.push(key.to_vec());
-                }
-                return Ok(());
-            }
-            if self
-                .max_count
-                .compare_exchange_weak(current, count, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                let mut results = self.results.lock().unwrap();
-                if self.max_count.load(Ordering::Relaxed) == count {
-                    if let Some(store) = &self.shift_path_store {
-                        store.replace_all(count, &[key.to_vec()])?;
-                    }
-                    results.results = 1;
-                    results.shifts.clear();
-                    results.shifts.push(key.to_vec());
-                }
-                return Ok(());
-            }
+    fn record_path(&self, score: usize, key: &[usize]) -> Result<(), String> {
+        if score < self.target {
+            return Ok(());
         }
+        // if score < self.max_score.load(Ordering::Relaxed) {
+        //     return Ok(());
+        // }
+
+        let mut results = self.results.lock().unwrap();
+        let current = self.max_score.load(Ordering::Relaxed);
+        if score < current {
+            return Ok(());
+        }
+        if score > current {
+            self.max_score.store(score, Ordering::Relaxed);
+            results.results = 1;
+            results.shifts.clear();
+            results.shifts.push(key.to_vec());
+            return Ok(());
+        }
+
+        if !results
+            .shifts
+            .iter()
+            .any(|existing| existing.as_slice() == key)
+        {
+            results.results += 1;
+            results.shifts.push(key.to_vec());
+        }
+        Ok(())
     }
 
     fn snapshot(&self) -> SharedResults {
         let mut results = self.results.lock().unwrap().clone();
-        results.max_count = self.max_count.load(Ordering::Relaxed);
+        results.max_score = self.max_score.load(Ordering::Relaxed);
         results
     }
 }
@@ -182,6 +168,7 @@ struct ParallelSearchCtx<'a> {
     interrupted: &'a AtomicBool,
     checkpoint_lock: Mutex<()>,
     last_checkpoint_nodes: AtomicU64,
+    progress_bar: Option<ProgressBar>,
 }
 
 struct ParallelJob {
@@ -194,7 +181,7 @@ pub struct State {
     pub primes: Vec<usize>,
     pub key: Vec<usize>,
     pub zero_mask: BitMask,
-    pub max_count: usize,
+    pub max_score: usize,
     pub target: usize,
     pub target_count: usize,
     pub target_shifts: Vec<Vec<usize>>,
@@ -204,6 +191,7 @@ pub struct State {
     pub checkpoint_interval: u64,
     shift_table: Vec<Vec<BitMask>>,
     shift_path_store: Option<ShiftPathStore>,
+    progress_bar: Option<ProgressBar>,
 }
 
 impl State {
@@ -212,7 +200,7 @@ impl State {
             primes,
             key: Vec::new(),
             zero_mask: BitMask::new_ones(cols),
-            max_count: 0,
+            max_score: 0,
             target: 447,
             target_count: 0,
             target_shifts: Vec::new(),
@@ -222,7 +210,50 @@ impl State {
             checkpoint_interval: 100_000,
             shift_table,
             shift_path_store: None,
+            progress_bar: None,
         }
+    }
+
+    pub fn set_progress_bar(&mut self, progress_bar: ProgressBar) {
+        self.progress_bar = Some(progress_bar);
+    }
+
+    pub fn finish_progress(&self, completed: bool) {
+        let Some(progress_bar) = &self.progress_bar else {
+            return;
+        };
+        let status = if completed {
+            "探索完了"
+        } else {
+            "探索中断"
+        };
+        progress_bar.finish_with_message(format!(
+            "{}: nodes={} best={} hits={}",
+            status,
+            HumanCount(self.node_count),
+            self.max_score,
+            self.results
+        ));
+    }
+
+    fn update_progress(
+        progress_bar: Option<&ProgressBar>,
+        nodes: u64,
+        max_score: usize,
+        results: usize,
+        depth: usize,
+    ) {
+        let Some(progress_bar) = progress_bar else {
+            return;
+        };
+        progress_bar.set_position(nodes);
+        progress_bar.set_message(format!(
+            "探索中: nodes={} best={} hits={} depth={}",
+            HumanCount(nodes),
+            max_score,
+            results,
+            depth
+        ));
     }
 
     pub fn set_shift_path_store(
@@ -239,6 +270,7 @@ impl State {
 
     fn load_checkpoint_paths(
         &self,
+        expected_max_score: usize,
         expected_results: usize,
         expected_target_count: usize,
     ) -> Result<(ShiftPaths, ShiftPaths), String> {
@@ -250,7 +282,11 @@ impl State {
                 "チェックポイントの結果パスを復元するための SQLite 出力がありません".to_string(),
             );
         };
-        let shifts = store.load_paths()?;
+        let shifts = if expected_results == 0 {
+            Vec::new()
+        } else {
+            store.load_result_paths(expected_max_score)?
+        };
         let target_shifts = store.load_target_paths()?;
         if shifts.len() != expected_results || target_shifts.len() != expected_target_count {
             return Err(format!(
@@ -264,25 +300,42 @@ impl State {
         Ok((shifts, target_shifts))
     }
 
-    fn aggregate_leaf_result(&mut self, count: usize, key: &[usize]) -> Result<(), String> {
-        if count > self.max_count {
-            if let Some(store) = &self.shift_path_store {
-                store.replace_all(count, &[key.to_vec()])?;
-            }
-            self.max_count = count;
+    fn load_previous_depth_paths(
+        &self,
+        depth: usize,
+    ) -> Result<Option<ShiftPaths>, Box<dyn std::error::Error>> {
+        if depth == 0 {
+            return Ok(None);
+        }
+        let Some(store) = self.shift_path_store.as_ref() else {
+            return Ok(None);
+        };
+        let paths = store
+            .load_full_depth_paths(depth - 1)
+            .map_err(std::io::Error::other)?;
+        Ok((!paths.is_empty()).then_some(paths))
+    }
+
+    fn aggregate_leaf_result(&mut self, score: usize, key: &[usize]) -> Result<(), String> {
+        if score < self.target {
+            info!(
+                "target break (depth={} score={}, key={:?})",
+                self.key.len(),
+                score,
+                key
+            );
+            return Ok(());
+        }
+        if score > self.max_score {
+            self.max_score = score;
             self.results = 1;
             self.shifts.clear();
             self.shifts.push(key.to_vec());
-            // info!("best level={} key={:?} count={}", key.len() - 1, key, count);
-        } else if count == self.max_count {
-            if self.results <= 500 {
-                if let Some(store) = &self.shift_path_store {
-                    store.append(count, key)?;
-                }
-            }
+            info!("best level={} key={:?} score={}", key.len() - 1, key, score);
+        } else if score == self.max_score {
             self.results += 1;
             self.shifts.push(key.to_vec());
-            debug!("best level={} key={:?} count={}", key.len() - 1, key, count);
+            debug!("best level={} key={:?} score={}", key.len() - 1, key, score);
         }
         Ok(())
     }
@@ -290,10 +343,10 @@ impl State {
     fn aggregate_target_result(
         &mut self,
         depth: usize,
-        count: usize,
+        score: usize,
         key: &[usize],
     ) -> Result<(), String> {
-        if depth == 249 && count == self.target {
+        if depth == 249 && score == self.target {
             let target_count = self.target_count + 1;
             if let Some(store) = &self.shift_path_store {
                 store.append_target(target_count, key)?;
@@ -328,7 +381,7 @@ impl State {
         resume_path: Option<&Path>,
         interrupted: &AtomicBool,
     ) -> Result<bool, Box<dyn std::error::Error>> {
-        let mut stack = if let Some(path) = resume_path {
+        let (mut stack, mut pending_prefixes) = if let Some(path) = resume_path {
             let checkpoint = Self::load_checkpoint(path)?;
             if checkpoint.mode != SearchMode::Sequential {
                 return Err(
@@ -337,11 +390,15 @@ impl State {
             }
             self.apply_checkpoint_config(&checkpoint, depth)?;
             self.key = checkpoint.key.clone();
-            self.max_count = checkpoint.max_count;
+            self.max_score = checkpoint.max_score;
             self.results = checkpoint.results;
             self.target_count = checkpoint.target_count;
             (self.shifts, self.target_shifts) = self
-                .load_checkpoint_paths(checkpoint.results, checkpoint.target_count)
+                .load_checkpoint_paths(
+                    checkpoint.max_score,
+                    checkpoint.results,
+                    checkpoint.target_count,
+                )
                 .map_err(std::io::Error::other)?;
             self.node_count = checkpoint.node_count;
             info!(
@@ -349,28 +406,61 @@ impl State {
                 checkpoint.node_count
             );
 
-            self.restore_stack(&checkpoint.stack)?
+            (
+                self.restore_stack(&checkpoint.stack)?,
+                checkpoint.pending_prefixes,
+            )
+        } else if let Some(previous_paths) = self.load_previous_depth_paths(depth)? {
+            info!(
+                "depth={} の開始パスとして depth={} の保存済みパス {} 件を使用します",
+                depth,
+                depth - 1,
+                previous_paths.len()
+            );
+            (Vec::new(), previous_paths.into_iter().rev().collect())
         } else {
-            vec![Frame {
-                level: 0,
-                next_idx: self.primes[0],
-            }]
+            (
+                vec![Frame {
+                    level: 0,
+                    next_idx: self.primes[0],
+                }],
+                Vec::new(),
+            )
         };
         let mut masks = self.rebuild_masks(depth, &self.key);
         let mut checkpoint_due = false;
+        Self::update_progress(
+            self.progress_bar.as_ref(),
+            self.node_count,
+            self.max_score,
+            self.results,
+            self.key.len(),
+        );
 
-        while !stack.is_empty() {
+        loop {
             if interrupted.load(Ordering::SeqCst) {
                 if let Some(path) = checkpoint_path {
-                    self.write_checkpoint(path, depth, &stack)?;
+                    self.write_checkpoint(path, depth, &stack, &pending_prefixes)?;
                 }
                 return Ok(false);
             }
             if checkpoint_due {
                 if let Some(path) = checkpoint_path {
-                    self.write_checkpoint(path, depth, &stack)?;
+                    self.write_checkpoint(path, depth, &stack, &pending_prefixes)?;
                 }
                 checkpoint_due = false;
+            }
+            if stack.is_empty() {
+                let Some(prefix) = pending_prefixes.pop() else {
+                    break;
+                };
+                self.key = prefix;
+                masks = self.rebuild_masks(depth, &self.key);
+                stack.push(Frame {
+                    level: depth - 1,
+                    next_idx: self.primes[depth - 1],
+                });
+                continue;
             }
             let frame = stack.last_mut().expect("探索スタックが空です");
             if frame.next_idx == 0 {
@@ -392,20 +482,38 @@ impl State {
                 node_masks[0].bitand_into_count(&base_masks[level], &self.shift_table[level][i]);
 
             if self.node_count.is_multiple_of(self.checkpoint_interval) {
-                info!(
-                    "探索経過: n={} h={} d={} k={:?}",
+                Self::update_progress(
+                    self.progress_bar.as_ref(),
                     self.node_count,
-                    # self.max_count,
+                    self.max_score,
                     self.results,
                     self.key.len(),
-                    self.key,
+                );
+                info!(
+                    "探索経過: nodes={} best={} hits={} depth={}",
+                    self.node_count,
+                    self.max_score,
+                    self.results,
+                    self.key.len()
                 );
                 checkpoint_due = true;
             }
 
             if count < self.target {
+                info!(
+                    "target break (depth={} count={}, key={:?})",
+                    self.key.len(),
+                    count,
+                    self.key
+                );
                 self.key.pop();
                 continue;
+            }
+
+            if let Some(store) = &self.shift_path_store {
+                store
+                    .append(count, &self.key)
+                    .map_err(std::io::Error::other)?;
             }
 
             if level + 1 >= depth {
@@ -425,7 +533,7 @@ impl State {
         }
         info!("探索完了 (nodes={})", self.node_count);
         if let Some(path) = checkpoint_path {
-            self.write_checkpoint(path, depth, &stack)?;
+            self.write_checkpoint(path, depth, &stack, &pending_prefixes)?;
         }
         Ok(!interrupted.load(Ordering::SeqCst))
     }
@@ -435,6 +543,7 @@ impl State {
         path: &Path,
         depth: usize,
         stack: &[Frame],
+        pending_prefixes: &[Vec<usize>],
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.write_checkpoint_file(
             path,
@@ -443,13 +552,14 @@ impl State {
                 depth,
                 stack: stack.to_vec(),
                 key: self.key.clone(),
-                max_count: self.max_count,
+                max_score: self.max_score,
                 results: self.results,
                 target_count: self.target_count,
                 node_count: self.node_count,
                 split_depth: 0,
                 completed: Vec::new(),
                 in_progress: Vec::new(),
+                pending_prefixes: pending_prefixes.to_vec(),
             },
         )
     }
@@ -544,7 +654,7 @@ impl State {
         interrupted: &AtomicBool,
     ) -> Result<(SharedResults, bool), Box<dyn std::error::Error>> {
         let results = Arc::new(ParallelResults {
-            max_count: AtomicUsize::new(0),
+            max_score: AtomicUsize::new(0),
             results: Mutex::new(SharedResults::default()),
             target: self.target,
             shift_path_store: self.shift_path_store.clone(),
@@ -570,13 +680,17 @@ impl State {
             split_depth = checkpoint.split_depth;
             node_count.store(checkpoint.node_count, Ordering::Relaxed);
             results
-                .max_count
-                .store(checkpoint.max_count, Ordering::Relaxed);
+                .max_score
+                .store(checkpoint.max_score, Ordering::Relaxed);
             let (shifts, target_shifts) = self
-                .load_checkpoint_paths(checkpoint.results, checkpoint.target_count)
+                .load_checkpoint_paths(
+                    checkpoint.max_score,
+                    checkpoint.results,
+                    checkpoint.target_count,
+                )
                 .map_err(std::io::Error::other)?;
             *results.results.lock().unwrap() = SharedResults {
-                max_count: checkpoint.max_count,
+                max_score: checkpoint.max_score,
                 results: checkpoint.results,
                 shifts,
                 target_count: checkpoint.target_count,
@@ -598,7 +712,27 @@ impl State {
             );
         }
 
-        let work_items = self.parallel_work_items(split_depth);
+        let previous_paths = self.load_previous_depth_paths(depth)?;
+        let work_items = if let Some(previous_paths) = previous_paths {
+            if split_depth != depth - 1 {
+                if resume_path.is_some() {
+                    return Err(
+                        "前深さパスを使用する探索のチェックポイント split_depth が不正です".into(),
+                    );
+                }
+                split_depth = depth - 1;
+            }
+            let work_items = self.previous_depth_work_items(depth, previous_paths)?;
+            info!(
+                "depth={} の開始ワーク項目として depth={} の保存済みパス {} 件を使用します",
+                depth,
+                depth - 1,
+                work_items.len()
+            );
+            work_items
+        } else {
+            self.parallel_work_items(split_depth)?
+        };
         let jobs = {
             let progress = progress.lock().unwrap();
             self.parallel_jobs(&work_items, &progress)?
@@ -614,7 +748,16 @@ impl State {
             interrupted,
             checkpoint_lock: Mutex::new(()),
             last_checkpoint_nodes: AtomicU64::new(node_count.load(Ordering::Relaxed)),
+            progress_bar: self.progress_bar.clone(),
         };
+        let shared = results.snapshot();
+        Self::update_progress(
+            ctx.progress_bar.as_ref(),
+            node_count.load(Ordering::Relaxed),
+            shared.max_score,
+            shared.results,
+            0,
+        );
 
         jobs.into_par_iter()
             .try_for_each(|job| self.run_parallel_job(job, &ctx))?;
@@ -688,9 +831,13 @@ impl State {
             let key = work_item.key;
             if ctx.split_depth == depth {
                 let count = masks[ctx.split_depth].count_ones();
-                if count >= self.target {
+                if count < self.target {
+                } else {
+                    if let Some(store) = &ctx.results.shift_path_store {
+                        store.append(count, &key)?;
+                    }
                     ctx.results.record_target(depth, count, &key)?;
-                    ctx.results.record_best(count, &key)?;
+                    ctx.results.record_path(count, &key)?;
                 }
                 self.finish_parallel_job(index, ctx)?;
                 return Ok(());
@@ -742,10 +889,17 @@ impl State {
                 let n = ctx.node_count.fetch_add(local_nodes, Ordering::Relaxed) + local_nodes;
                 local_nodes = 0;
                 let shared = ctx.results.snapshot();
+                Self::update_progress(
+                    ctx.progress_bar.as_ref(),
+                    n,
+                    shared.max_score,
+                    shared.results,
+                    key.len(),
+                );
                 info!(
                     "探索経過: n={} h={} d={} k={:?}",
                     n,
-                    # shared.max_count,
+                    shared.max_score,
                     shared.results,
                     key.len(),
                     key
@@ -755,13 +909,23 @@ impl State {
             }
 
             if c_count < self.target {
+                info!(
+                    "target break (depth={}, count={}, key={:?})",
+                    key.len(),
+                    c_count,
+                    key
+                );
                 key.pop();
                 continue;
             }
 
+            if let Some(store) = &ctx.results.shift_path_store {
+                store.append(c_count, &key)?;
+            }
+
             if level + 1 >= depth {
                 ctx.results.record_target(depth, c_count, &key)?;
-                ctx.results.record_best(c_count, &key)?;
+                ctx.results.record_path(c_count, &key)?;
                 key.pop();
                 continue;
             }
@@ -850,13 +1014,14 @@ impl State {
                 depth: ctx.depth,
                 stack: Vec::new(),
                 key: Vec::new(),
-                max_count: shared.max_count,
+                max_score: shared.max_score,
                 results: shared.results,
                 target_count: shared.target_count,
                 node_count: n,
                 split_depth: ctx.split_depth,
                 completed,
                 in_progress,
+                pending_prefixes: Vec::new(),
             },
         )
         .map_err(|err| err.to_string())?;
@@ -876,7 +1041,7 @@ impl State {
         depth
     }
 
-    fn parallel_work_items(&self, split_depth: usize) -> Vec<WorkItem> {
+    fn parallel_work_items(&self, split_depth: usize) -> Result<Vec<WorkItem>, String> {
         let mut work_items = vec![WorkItem {
             key: Vec::with_capacity(split_depth),
             base_mask: self.zero_mask.clone(),
@@ -887,23 +1052,63 @@ impl State {
             for item in work_items {
                 for shift in (0..self.primes[level]).rev() {
                     let mut base_mask = self.zero_mask.clone();
-                    let _ = base_mask
+                    let count = base_mask
                         .bitand_into_count(&item.base_mask, &self.shift_table[level][shift]);
                     let mut key = item.key.clone();
                     key.push(shift);
+                    if count < self.target {
+                        continue;
+                    }
+                    if let Some(store) = &self.shift_path_store {
+                        store.append(count, &key)?;
+                    }
                     next_items.push(WorkItem { key, base_mask });
                 }
             }
             work_items = next_items;
         }
 
-        work_items
+        Ok(work_items)
+    }
+
+    fn previous_depth_work_items(
+        &self,
+        depth: usize,
+        paths: ShiftPaths,
+    ) -> Result<Vec<WorkItem>, String> {
+        let mut work_items = Vec::with_capacity(paths.len());
+        for key in paths {
+            if key
+                .iter()
+                .enumerate()
+                .any(|(level, &shift)| shift >= self.primes[level])
+            {
+                return Err(format!(
+                    "depth={} の保存済みシフトパスに範囲外の値が含まれています: {:?}",
+                    depth - 1,
+                    key
+                ));
+            }
+            let masks = self.rebuild_masks(depth, &key);
+            let base_mask = masks[depth - 1].clone();
+            let count = base_mask.count_ones();
+            if count < self.target {
+                continue;
+            }
+            if let Some(store) = &self.shift_path_store {
+                store.append(count, &key)?;
+            }
+            work_items.push(WorkItem { key, base_mask });
+        }
+        Ok(work_items)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{build_shift_table, State};
+    use super::{build_shift_table, ParallelResults, State};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Mutex;
 
     #[test]
     fn build_shift_table_creates_expected_complement_masks() {
@@ -912,6 +1117,25 @@ mod tests {
         assert_eq!(table[0].len(), 2);
         assert_eq!(table[0][0].count_ones(), 3);
         assert_eq!(table[0][1].count_ones(), 3);
+    }
+
+    #[test]
+    fn parallel_results_keep_only_paths_at_the_current_maximum() {
+        let results = ParallelResults {
+            max_score: AtomicUsize::new(0),
+            results: Mutex::new(Default::default()),
+            target: 0,
+            shift_path_store: None,
+        };
+
+        results.record_path(1, &[0]).unwrap();
+        results.record_path(2, &[1]).unwrap();
+        results.record_path(2, &[2]).unwrap();
+
+        let snapshot = results.snapshot();
+        assert_eq!(snapshot.max_score, 2);
+        assert_eq!(snapshot.results, 2);
+        assert_eq!(snapshot.shifts, vec![vec![1], vec![2]]);
     }
 
     #[test]
@@ -927,7 +1151,7 @@ mod tests {
         let result = parallel.search_parallel(2, None, None).unwrap();
 
         assert!(sequential.results > 0);
-        assert_eq!(result.max_count, sequential.max_count);
+        assert_eq!(result.max_score, sequential.max_score);
         assert_eq!(result.results, sequential.results);
         assert_eq!(result.shifts.len(), result.results);
         for shifts in &result.shifts {
@@ -952,17 +1176,17 @@ mod tests {
         parallel.target = 0;
         let result = parallel.search_parallel(1, None, None).unwrap();
 
-        assert_eq!(sequential.max_count, 2);
+        assert_eq!(sequential.max_score, 2);
         assert_eq!(sequential.results, 2);
         assert_eq!(sequential.shifts, vec![vec![1], vec![0]]);
-        assert_eq!(result.max_count, 2);
+        assert_eq!(result.max_score, 2);
         assert_eq!(result.results, 2);
         assert_eq!(result.shifts.len(), 2);
     }
 
     #[test]
-    fn sequential_search_writes_best_paths_to_sqlite() {
-        let primes = vec![2];
+    fn sequential_search_writes_each_unpruned_path_to_sqlite() {
+        let primes = vec![2, 3];
         let cols = 4;
         let table = build_shift_table(&primes, cols);
         let path = std::env::temp_dir().join(format!(
@@ -975,26 +1199,81 @@ mod tests {
         ));
         let mut state = State::new(primes, cols, table);
         state.target = 0;
-        state.set_shift_path_store(&path, 1, true).unwrap();
+        state.set_shift_path_store(&path, 2, true).unwrap();
 
-        state.search_with_checkpoint(1, None, None).unwrap();
+        state.search_with_checkpoint(2, None, None).unwrap();
 
         let connection = rusqlite::Connection::open(&path).unwrap();
-        let rows: Vec<(usize, usize, String)> = connection
-            .prepare("SELECT depth, max_count, shifts FROM shift_paths ORDER BY shifts DESC")
+        let nodes: Vec<(usize, usize)> = connection
+            .prepare("SELECT depth, shift FROM shift_paths ORDER BY node_id")
             .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        assert_eq!(
-            rows,
-            vec![(1, 2, "[1]".to_string()), (1, 2, "[0]".to_string())]
-        );
+        assert_eq!(nodes.len(), 8);
+        assert_eq!(nodes.iter().filter(|(depth, _)| *depth == 1).count(), 2);
+        assert_eq!(nodes.iter().filter(|(depth, _)| *depth == 2).count(), 6);
+        let leaves: usize = connection
+            .query_row(
+                "SELECT COUNT(*) FROM shift_path_leaves WHERE depth = 2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leaves, 6);
 
         drop(connection);
         drop(state);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn search_uses_previous_depth_paths_as_prefixes_when_available() {
+        let depth = 2;
+        let primes = vec![2; depth];
+        let cols = 4;
+        let table = build_shift_table(&primes, cols);
+        let database_path = unique_checkpoint_path("previous-depth-paths").with_extension("db");
+        let prefix = vec![0; depth - 1];
+
+        let mut previous = State::new(primes.clone(), cols, table.clone());
+        previous
+            .set_shift_path_store(&database_path, depth - 1, true)
+            .unwrap();
+        previous
+            .shift_path_store
+            .as_ref()
+            .unwrap()
+            .append(2, &prefix)
+            .unwrap();
+        drop(previous);
+
+        let mut sequential = State::new(primes.clone(), cols, table.clone());
+        sequential.target = 0;
+        sequential
+            .set_shift_path_store(&database_path, depth, false)
+            .unwrap();
+        sequential
+            .search_with_checkpoint(depth, None, None)
+            .unwrap();
+        assert_eq!(sequential.node_count, 2);
+        assert!(sequential
+            .shifts
+            .iter()
+            .all(|path| path[..depth - 1] == prefix));
+        drop(sequential);
+
+        let mut parallel = State::new(primes, cols, table);
+        parallel.target = 0;
+        parallel
+            .set_shift_path_store(&database_path, depth, false)
+            .unwrap();
+        let result = parallel.search_parallel(depth, None, None).unwrap();
+        assert!(result.shifts.iter().all(|path| path[..depth - 1] == prefix));
+
+        drop(parallel);
+        std::fs::remove_file(database_path).unwrap();
     }
 
     #[test]
@@ -1005,17 +1284,16 @@ mod tests {
     }
 
     #[test]
-    fn target_prunes_smaller_counts() {
-        let primes = vec![2, 3];
+    fn target_defaults_to_447_and_prunes_smaller_counts() {
+        let primes = vec![2];
         let cols = 4;
         let table = build_shift_table(&primes, cols);
         let mut sequential = State::new(primes.clone(), cols, table.clone());
         assert_eq!(sequential.target, 447);
         sequential.target = 3;
 
-        sequential.search_with_checkpoint(2, None, None).unwrap();
+        sequential.search_with_checkpoint(1, None, None).unwrap();
         assert_eq!(sequential.results, 0);
-        assert_eq!(sequential.node_count, 2);
 
         let mut parallel = State::new(primes, cols, table);
         parallel.target = 3;
@@ -1098,7 +1376,7 @@ mod tests {
 
         state.key = vec![1, 0];
         state.node_count = 10;
-        state.max_count = 2;
+        state.max_score = 2;
         state.results = 0;
 
         let saved_stack = vec![super::Frame {
@@ -1138,13 +1416,14 @@ mod tests {
                 next_idx: 1,
             }],
             key: vec![1],
-            max_count: 2,
+            max_score: 2,
             results: 0,
             target_count: 0,
             node_count: 100,
             split_depth: 0,
             completed: vec![],
             in_progress: vec![],
+            pending_prefixes: vec![],
         };
         let json = serde_json::to_string_pretty(&checkpoint).unwrap();
         assert!(json.contains("depth"));
@@ -1178,7 +1457,7 @@ mod tests {
             level: 0,
             next_idx: 2,
         }];
-        saved.write_checkpoint(&path, 1, &stack).unwrap();
+        saved.write_checkpoint(&path, 1, &stack, &[]).unwrap();
         assert!(!std::fs::read_to_string(&path).unwrap().contains('\n'));
 
         let mut resumed = State::new(primes, cols, table);
@@ -1249,7 +1528,7 @@ mod tests {
             .search_parallel(depth, Some(&path), Some(&path))
             .unwrap();
 
-        assert_eq!(result.max_count, expected.max_count);
+        assert_eq!(result.max_score, expected.max_score);
         assert_eq!(result.results, expected.results);
         assert_eq!(result.shifts.len(), expected.results);
 
@@ -1266,13 +1545,14 @@ mod tests {
         let depth = 3;
         let table = build_shift_table(&primes, cols);
         let mut state = State::new(primes.clone(), cols, table.clone());
+        state.target = 0;
         let split_depth = state.parallel_split_depth(depth);
-        let work_items = state.parallel_work_items(split_depth);
+        let work_items = state.parallel_work_items(split_depth).unwrap();
         assert!(!work_items.is_empty());
 
-        let expected = State::new(primes.clone(), cols, table.clone())
-            .search_parallel(depth, None, None)
-            .unwrap();
+        let mut expected_state = State::new(primes.clone(), cols, table.clone());
+        expected_state.target = 0;
+        let expected = expected_state.search_parallel(depth, None, None).unwrap();
 
         let path = unique_checkpoint_path("parallel-completed");
         let database_path = path.with_extension("db");
@@ -1280,9 +1560,9 @@ mod tests {
             .set_shift_path_store(&database_path, depth, true)
             .unwrap();
         let store = state.shift_path_store.as_ref().unwrap();
-        store
-            .replace_all(expected.max_count, &expected.shifts)
-            .unwrap();
+        for shifts in &expected.shifts {
+            store.append(expected.max_score, shifts).unwrap();
+        }
         for (index, target_shifts) in expected.target_shifts.iter().enumerate() {
             store.append_target(index + 1, target_shifts).unwrap();
         }
@@ -1295,13 +1575,14 @@ mod tests {
                     depth,
                     stack: Vec::new(),
                     key: Vec::new(),
-                    max_count: expected.max_count,
+                    max_score: expected.max_score,
                     results: expected.results,
                     target_count: expected.target_count,
                     node_count: 42,
                     split_depth,
                     completed,
                     in_progress: Vec::new(),
+                    pending_prefixes: Vec::new(),
                 },
             )
             .unwrap();
@@ -1313,7 +1594,7 @@ mod tests {
         let result = resumed
             .search_parallel(depth, Some(&path), Some(&path))
             .unwrap();
-        assert_eq!(result.max_count, expected.max_count);
+        assert_eq!(result.max_score, expected.max_score);
         assert_eq!(result.results, expected.results);
         assert_eq!(result.shifts, expected.shifts);
 
@@ -1338,6 +1619,7 @@ mod tests {
                     level: 0,
                     next_idx: 2,
                 }],
+                &[],
             )
             .unwrap();
 
@@ -1369,13 +1651,14 @@ mod tests {
                     depth,
                     stack: Vec::new(),
                     key: Vec::new(),
-                    max_count: 0,
+                    max_score: 0,
                     results: 0,
                     target_count: 0,
                     node_count: 0,
                     split_depth: 1,
                     completed: Vec::new(),
                     in_progress: Vec::new(),
+                    pending_prefixes: Vec::new(),
                 },
             )
             .unwrap();

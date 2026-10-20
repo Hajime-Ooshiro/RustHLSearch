@@ -1,5 +1,6 @@
 use crate::bitmask::BitMask;
 use crate::sqlite_output::ShiftPathStore;
+use indicatif::{HumanCount, ProgressBar};
 use log::{debug, info};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -167,6 +168,7 @@ struct ParallelSearchCtx<'a> {
     interrupted: &'a AtomicBool,
     checkpoint_lock: Mutex<()>,
     last_checkpoint_nodes: AtomicU64,
+    progress_bar: Option<ProgressBar>,
 }
 
 struct ParallelJob {
@@ -189,6 +191,7 @@ pub struct State {
     pub checkpoint_interval: u64,
     shift_table: Vec<Vec<BitMask>>,
     shift_path_store: Option<ShiftPathStore>,
+    progress_bar: Option<ProgressBar>,
 }
 
 impl State {
@@ -207,7 +210,50 @@ impl State {
             checkpoint_interval: 100_000,
             shift_table,
             shift_path_store: None,
+            progress_bar: None,
         }
+    }
+
+    pub fn set_progress_bar(&mut self, progress_bar: ProgressBar) {
+        self.progress_bar = Some(progress_bar);
+    }
+
+    pub fn finish_progress(&self, completed: bool) {
+        let Some(progress_bar) = &self.progress_bar else {
+            return;
+        };
+        let status = if completed {
+            "探索完了"
+        } else {
+            "探索中断"
+        };
+        progress_bar.finish_with_message(format!(
+            "{}: nodes={} best={} hits={}",
+            status,
+            HumanCount(self.node_count),
+            self.max_score,
+            self.results
+        ));
+    }
+
+    fn update_progress(
+        progress_bar: Option<&ProgressBar>,
+        nodes: u64,
+        max_score: usize,
+        results: usize,
+        depth: usize,
+    ) {
+        let Some(progress_bar) = progress_bar else {
+            return;
+        };
+        progress_bar.set_position(nodes);
+        progress_bar.set_message(format!(
+            "探索中: nodes={} best={} hits={} depth={}",
+            HumanCount(nodes),
+            max_score,
+            results,
+            depth
+        ));
     }
 
     pub fn set_shift_path_store(
@@ -383,6 +429,13 @@ impl State {
         };
         let mut masks = self.rebuild_masks(depth, &self.key);
         let mut checkpoint_due = false;
+        Self::update_progress(
+            self.progress_bar.as_ref(),
+            self.node_count,
+            self.max_score,
+            self.results,
+            self.key.len(),
+        );
 
         loop {
             if interrupted.load(Ordering::SeqCst) {
@@ -429,6 +482,13 @@ impl State {
                 node_masks[0].bitand_into_count(&base_masks[level], &self.shift_table[level][i]);
 
             if self.node_count.is_multiple_of(self.checkpoint_interval) {
+                Self::update_progress(
+                    self.progress_bar.as_ref(),
+                    self.node_count,
+                    self.max_score,
+                    self.results,
+                    self.key.len(),
+                );
                 info!(
                     "探索経過: nodes={} best={} hits={} depth={}",
                     self.node_count,
@@ -688,7 +748,16 @@ impl State {
             interrupted,
             checkpoint_lock: Mutex::new(()),
             last_checkpoint_nodes: AtomicU64::new(node_count.load(Ordering::Relaxed)),
+            progress_bar: self.progress_bar.clone(),
         };
+        let shared = results.snapshot();
+        Self::update_progress(
+            ctx.progress_bar.as_ref(),
+            node_count.load(Ordering::Relaxed),
+            shared.max_score,
+            shared.results,
+            0,
+        );
 
         jobs.into_par_iter()
             .try_for_each(|job| self.run_parallel_job(job, &ctx))?;
@@ -815,6 +884,13 @@ impl State {
                 let n = ctx.node_count.fetch_add(local_nodes, Ordering::Relaxed) + local_nodes;
                 local_nodes = 0;
                 let shared = ctx.results.snapshot();
+                Self::update_progress(
+                    ctx.progress_bar.as_ref(),
+                    n,
+                    shared.max_score,
+                    shared.results,
+                    key.len(),
+                );
                 info!(
                     "探索経過: nodes={} best={} hits={} depth={} key={:?}",
                     n,

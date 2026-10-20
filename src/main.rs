@@ -5,6 +5,7 @@ mod search;
 mod sqlite_output;
 
 use clap::Parser;
+use indicatif::{ProgressBar, ProgressStyle};
 use log::{info, LevelFilter};
 use output::with_timestamp;
 use primes::{generate_primes, MAX_PRIME};
@@ -124,6 +125,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shift_table = build_shift_table(&primes[..cli.depth], cli.cols);
     let mut state = State::new(primes, cli.cols, shift_table);
     state.checkpoint_interval = cli.checkpoint_interval;
+    let progress_bar = ProgressBar::new_spinner();
+    progress_bar.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} {msg}")?
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+    );
+    progress_bar.enable_steady_tick(std::time::Duration::from_millis(100));
+    state.set_progress_bar(progress_bar);
 
     // 探索中にチェックポイントを書き出すため、他の出力より先に output_dir を用意する
     std::fs::create_dir_all(&cli.output_dir)?;
@@ -161,6 +169,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if !completed {
+        state.finish_progress(false);
         info!(
             "中断要求を受信したためチェックポイントを保存しました: {}",
             checkpoint_path.display()
@@ -179,6 +188,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    state.finish_progress(true);
     let elapsed = start_time.elapsed();
     info!("探索時間: {:?}", elapsed);
     info!("最大値: {}", state.max_score);

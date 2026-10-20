@@ -54,6 +54,7 @@ src/
   bitmask.rs   # BitMaskによる64-bit単位のビット演算
   primes.rs    # エラトステネスの篩による素数生成
   search.rs    # シフトテーブル生成と逐次・並列DFS
+  sqlite_output.rs # SQLite の親ノード形式シフトパス永続化
   output.rs    # タイムスタンプ付き出力パス生成
 ```
 
@@ -92,6 +93,8 @@ cargo run --release -- --mode parallel
 ```
 
 探索中は 100,000 ノードごとに進捗を更新し、DFS の状態と集計値を `--output-dir`（既定は `.`）配下の `checkpoint.json` に自動保存します。実行中に `Ctrl+C` を1回押すと、安全な探索地点で同じチェックポイントを保存して終了します。次回は同じコマンドを実行すると中断地点から再開できます。シフトパスとターゲット一致パスは `HLSearch.db` に保存され、再開時にそこから復元します。更新前の世代は同じディレクトリの `checkpoint.bak` に退避されます。起動時に `checkpoint.json` が存在しない場合は `checkpoint.bak` から復旧を試みます。探索が正常終了すると `checkpoint.json` とバックアップは削除されます。逐次チェックポイントは `--mode sequential` でのみ、並列チェックポイントは `--mode parallel` でのみ再開できます。
+
+深さ 15 以上の探索では、同じ `HLSearch.db` の `depth - 1` に保存された完全長の `shift_paths` を開始パスとして読み込みます。そのため、深さ 15 の探索前には同じ `--output-dir` と探索条件で深さ 14 の探索を完了しておく必要があります。前深さに通過パスがなければ、探索対象は存在しないため結果は 0 件になります。
 
 ログは `SimpleLogger` により既定で `INFO` レベル以上が出力されます。主要イベントは `INFO`、詳細な探索経過は `DEBUG` として実装されていますが、既定のログレベルでは `DEBUG` ログは表示されません。進捗バーは使用しておらず、ログ出力のみで進捗を確認します。
 
@@ -153,7 +156,7 @@ cargo run --release -- --depth 10 --cols 4000 --output-dir results
 
 ## 出力ファイル形式
 
-出力ファイルは、シフトパスを `HLSearch.db`、探索結果を `result_depth8_YYYYMMDD_HHMMSS.txt` の形式で出力します。ターゲット値による枝刈りを通過した各シフトパスは、探索中に SQLite の `shift_paths` テーブルへ逐次保存されます。`max_count` 列には、そのパス時点の popcount を保存します。テーブルの主キーは `(depth, shifts)` で、実行開始時には対象深さの既存パスだけが初期化されます。チェックポイントの再開時には、探索深さと最終最大 popcount が一致する葉パスだけをこのテーブルから復元します。深さ 249 でターゲット値 447 に一致したパスは、発見ごとに `target_paths` テーブルへ `(depth, target_count, target_shifts)` として追加されます。`target_paths` の主キーは `(depth, target_shifts)` です。
+出力ファイルは、シフトパスを `HLSearch.db`、探索結果を `result_depth8_YYYYMMDD_HHMMSS.txt` の形式で出力します。ターゲット値による枝刈りを通過したシフトパスは、探索中に SQLite の親ノード形式で逐次保存されます。`shift_paths` は各ノードの `node_id`、`parent_node_id`、`shift`、パス長の `depth`、そのノードでの `max_count` を持ち、同じ接頭辞を複数パス・複数深さで共有します。完全長パスの記録は `shift_path_leaves` が `(depth, node_id, max_count)` として管理し、読み込み時には親参照をたどってシフト列を復元します。これにより深さ 15 以上の開始パス、チェックポイント再開時の最大葉パスを重複なく保存順で読み込めます。実行開始時の初期化は対象深さの葉記録だけを削除するため、他深さのパスや共有親ノードを壊しません。旧 JSON 配列形式の `shift_paths` テーブルは、初回オープン時に新形式へ再作成されます（旧パスは移行されません）。深さ 249 でターゲット値 447 に一致したパスは、発見ごとに `target_paths` テーブルへ `(depth, target_count, target_shifts)` として追加されます。`target_paths` の主キーは `(depth, target_shifts)` です。
 
 ファイルには実行時設定（`config`）と探索結果（`result`）を含むJSONオブジェクトが出力されます。
 

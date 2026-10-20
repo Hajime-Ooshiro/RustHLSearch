@@ -151,7 +151,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 resume_path,
                 &interrupted,
             )?;
-            state.max_count = result.max_count;
+            state.max_score = result.max_count;
             state.results = result.results;
             state.shifts = result.shifts;
             state.target_count = result.target_count;
@@ -181,7 +181,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let elapsed = start_time.elapsed();
     info!("探索時間: {:?}", elapsed);
-    info!("最大値: {}", state.max_count);
+    info!("最大値: {}", state.max_score);
     info!("該当件数: {}", state.results);
     info!("ターゲット一致件数: {}", state.target_count);
 
@@ -203,7 +203,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             elapsed: format!("{elapsed:?}"),
         },
         result: OutputResult {
-            max_count: state.max_count,
+            max_count: state.max_score,
             results: state.results,
             target_count: state.target_count,
             target_shifts: state.target_shifts,

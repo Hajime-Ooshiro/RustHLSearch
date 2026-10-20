@@ -47,6 +47,8 @@ struct ParallelInProgress {
 
 type ShiftPaths = Vec<Vec<usize>>;
 
+const PREVIOUS_DEPTH_REUSE_MIN_DEPTH: usize = 15;
+
 #[derive(Deserialize, Serialize)]
 struct Checkpoint {
     #[serde(default = "default_checkpoint_mode")]
@@ -65,6 +67,8 @@ struct Checkpoint {
     completed: Vec<usize>,
     #[serde(default)]
     in_progress: Vec<ParallelInProgress>,
+    #[serde(default)]
+    pending_prefixes: ShiftPaths,
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, clap::ValueEnum, Deserialize, Serialize)]
@@ -177,7 +181,7 @@ pub struct State {
     pub primes: Vec<usize>,
     pub key: Vec<usize>,
     pub zero_mask: BitMask,
-    pub max_count: usize,
+    pub max_score: usize,
     pub target: usize,
     pub target_count: usize,
     pub target_shifts: Vec<Vec<usize>>,
@@ -195,7 +199,7 @@ impl State {
             primes,
             key: Vec::new(),
             zero_mask: BitMask::new_ones(cols),
-            max_count: 0,
+            max_score: 0,
             target: 447,
             target_count: 0,
             target_shifts: Vec::new(),
@@ -252,6 +256,19 @@ impl State {
         Ok((shifts, target_shifts))
     }
 
+    fn load_previous_depth_paths(
+        &self,
+        depth: usize,
+    ) -> Result<ShiftPaths, Box<dyn std::error::Error>> {
+        let store = self
+            .shift_path_store
+            .as_ref()
+            .ok_or("前深さのシフトパスを読み込むための SQLite 出力がありません")?;
+        Ok(store
+            .load_full_depth_paths(depth - 1)
+            .map_err(std::io::Error::other)?)
+    }
+
     fn aggregate_leaf_result(&mut self, count: usize, key: &[usize]) -> Result<(), String> {
         if count < self.target {
             info!(
@@ -262,8 +279,8 @@ impl State {
             );
             return Ok(());
         }
-        if count > self.max_count {
-            self.max_count = count;
+        if count > self.max_score {
+            self.max_score = count;
             self.results = 1;
             self.shifts.clear();
             self.shifts.push(key.to_vec());
@@ -273,7 +290,7 @@ impl State {
                 key,
                 count
             );
-        } else if count == self.max_count {
+        } else if count == self.max_score {
             self.results += 1;
             self.shifts.push(key.to_vec());
             debug!(
@@ -327,7 +344,7 @@ impl State {
         resume_path: Option<&Path>,
         interrupted: &AtomicBool,
     ) -> Result<bool, Box<dyn std::error::Error>> {
-        let mut stack = if let Some(path) = resume_path {
+        let (mut stack, mut pending_prefixes) = if let Some(path) = resume_path {
             let checkpoint = Self::load_checkpoint(path)?;
             if checkpoint.mode != SearchMode::Sequential {
                 return Err(
@@ -336,7 +353,7 @@ impl State {
             }
             self.apply_checkpoint_config(&checkpoint, depth)?;
             self.key = checkpoint.key.clone();
-            self.max_count = checkpoint.max_count;
+            self.max_score = checkpoint.max_count;
             self.results = checkpoint.results;
             self.target_count = checkpoint.target_count;
             (self.shifts, self.target_shifts) = self
@@ -352,28 +369,55 @@ impl State {
                 checkpoint.node_count
             );
 
-            self.restore_stack(&checkpoint.stack)?
+            (
+                self.restore_stack(&checkpoint.stack)?,
+                checkpoint.pending_prefixes,
+            )
+        } else if depth >= PREVIOUS_DEPTH_REUSE_MIN_DEPTH {
+            let previous_paths = self.load_previous_depth_paths(depth)?;
+            info!(
+                "depth={} の開始パスとして depth={} の保存済みパス {} 件を使用します",
+                depth,
+                depth - 1,
+                previous_paths.len()
+            );
+            (Vec::new(), previous_paths.into_iter().rev().collect())
         } else {
-            vec![Frame {
-                level: 0,
-                next_idx: self.primes[0],
-            }]
+            (
+                vec![Frame {
+                    level: 0,
+                    next_idx: self.primes[0],
+                }],
+                Vec::new(),
+            )
         };
         let mut masks = self.rebuild_masks(depth, &self.key);
         let mut checkpoint_due = false;
 
-        while !stack.is_empty() {
+        loop {
             if interrupted.load(Ordering::SeqCst) {
                 if let Some(path) = checkpoint_path {
-                    self.write_checkpoint(path, depth, &stack)?;
+                    self.write_checkpoint(path, depth, &stack, &pending_prefixes)?;
                 }
                 return Ok(false);
             }
             if checkpoint_due {
                 if let Some(path) = checkpoint_path {
-                    self.write_checkpoint(path, depth, &stack)?;
+                    self.write_checkpoint(path, depth, &stack, &pending_prefixes)?;
                 }
                 checkpoint_due = false;
+            }
+            if stack.is_empty() {
+                let Some(prefix) = pending_prefixes.pop() else {
+                    break;
+                };
+                self.key = prefix;
+                masks = self.rebuild_masks(depth, &self.key);
+                stack.push(Frame {
+                    level: depth - 1,
+                    next_idx: self.primes[depth - 1],
+                });
+                continue;
             }
             let frame = stack.last_mut().expect("探索スタックが空です");
             if frame.next_idx == 0 {
@@ -398,7 +442,7 @@ impl State {
                 info!(
                     "探索経過: nodes={} best={} hits={} depth={}",
                     self.node_count,
-                    self.max_count,
+                    self.max_score,
                     self.results,
                     self.key.len()
                 );
@@ -439,7 +483,7 @@ impl State {
         }
         info!("探索完了 (nodes={})", self.node_count);
         if let Some(path) = checkpoint_path {
-            self.write_checkpoint(path, depth, &stack)?;
+            self.write_checkpoint(path, depth, &stack, &pending_prefixes)?;
         }
         Ok(!interrupted.load(Ordering::SeqCst))
     }
@@ -449,6 +493,7 @@ impl State {
         path: &Path,
         depth: usize,
         stack: &[Frame],
+        pending_prefixes: &[Vec<usize>],
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.write_checkpoint_file(
             path,
@@ -457,13 +502,14 @@ impl State {
                 depth,
                 stack: stack.to_vec(),
                 key: self.key.clone(),
-                max_count: self.max_count,
+                max_count: self.max_score,
                 results: self.results,
                 target_count: self.target_count,
                 node_count: self.node_count,
                 split_depth: 0,
                 completed: Vec::new(),
                 in_progress: Vec::new(),
+                pending_prefixes: pending_prefixes.to_vec(),
             },
         )
     }
@@ -616,7 +662,26 @@ impl State {
             );
         }
 
-        let work_items = self.parallel_work_items(split_depth)?;
+        let work_items = if depth >= PREVIOUS_DEPTH_REUSE_MIN_DEPTH {
+            if split_depth != depth - 1 {
+                if resume_path.is_some() {
+                    return Err(
+                        "前深さパスを使用する探索のチェックポイント split_depth が不正です".into(),
+                    );
+                }
+                split_depth = depth - 1;
+            }
+            let work_items = self.previous_depth_work_items(depth)?;
+            info!(
+                "depth={} の開始ワーク項目として depth={} の保存済みパス {} 件を使用します",
+                depth,
+                depth - 1,
+                work_items.len()
+            );
+            work_items
+        } else {
+            self.parallel_work_items(split_depth)?
+        };
         let jobs = {
             let progress = progress.lock().unwrap();
             self.parallel_jobs(&work_items, &progress)?
@@ -884,6 +949,7 @@ impl State {
                 split_depth: ctx.split_depth,
                 completed,
                 in_progress,
+                pending_prefixes: Vec::new(),
             },
         )
         .map_err(|err| err.to_string())?;
@@ -930,6 +996,37 @@ impl State {
             work_items = next_items;
         }
 
+        Ok(work_items)
+    }
+
+    fn previous_depth_work_items(&self, depth: usize) -> Result<Vec<WorkItem>, String> {
+        let paths = self
+            .load_previous_depth_paths(depth)
+            .map_err(|error| error.to_string())?;
+        let mut work_items = Vec::with_capacity(paths.len());
+        for key in paths {
+            if key
+                .iter()
+                .enumerate()
+                .any(|(level, &shift)| shift >= self.primes[level])
+            {
+                return Err(format!(
+                    "depth={} の保存済みシフトパスに範囲外の値が含まれています: {:?}",
+                    depth - 1,
+                    key
+                ));
+            }
+            let masks = self.rebuild_masks(depth, &key);
+            let base_mask = masks[depth - 1].clone();
+            let count = base_mask.count_ones();
+            if count < self.target {
+                continue;
+            }
+            if let Some(store) = &self.shift_path_store {
+                store.append(count, &key)?;
+            }
+            work_items.push(WorkItem { key, base_mask });
+        }
         Ok(work_items)
     }
 }
@@ -981,7 +1078,7 @@ mod tests {
         let result = parallel.search_parallel(2, None, None).unwrap();
 
         assert!(sequential.results > 0);
-        assert_eq!(result.max_count, sequential.max_count);
+        assert_eq!(result.max_count, sequential.max_score);
         assert_eq!(result.results, sequential.results);
         assert_eq!(result.shifts.len(), result.results);
         for shifts in &result.shifts {
@@ -1006,7 +1103,7 @@ mod tests {
         parallel.target = 0;
         let result = parallel.search_parallel(1, None, None).unwrap();
 
-        assert_eq!(sequential.max_count, 2);
+        assert_eq!(sequential.max_score, 2);
         assert_eq!(sequential.results, 2);
         assert_eq!(sequential.shifts, vec![vec![1], vec![0]]);
         assert_eq!(result.max_count, 2);
@@ -1034,25 +1131,76 @@ mod tests {
         state.search_with_checkpoint(2, None, None).unwrap();
 
         let connection = rusqlite::Connection::open(&path).unwrap();
-        let rows: Vec<(usize, String)> = connection
-            .prepare("SELECT max_count, shifts FROM shift_paths ORDER BY rowid")
+        let nodes: Vec<(usize, usize)> = connection
+            .prepare("SELECT depth, shift FROM shift_paths ORDER BY node_id")
             .unwrap()
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        assert_eq!(rows.len(), 8);
-        assert_eq!(rows.iter().filter(|(_, path)| path == "[1]").count(), 1);
-        assert_eq!(
-            rows.iter()
-                .filter(|(_, path)| serde_json::from_str::<Vec<usize>>(path).unwrap().len() == 2)
-                .count(),
-            6
-        );
+        assert_eq!(nodes.len(), 8);
+        assert_eq!(nodes.iter().filter(|(depth, _)| *depth == 1).count(), 2);
+        assert_eq!(nodes.iter().filter(|(depth, _)| *depth == 2).count(), 6);
+        let leaves: usize = connection
+            .query_row(
+                "SELECT COUNT(*) FROM shift_path_leaves WHERE depth = 2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leaves, 6);
 
         drop(connection);
         drop(state);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn depth_15_search_uses_depth_14_paths_as_prefixes() {
+        let depth = 15;
+        let primes = vec![2; depth];
+        let cols = 4;
+        let table = build_shift_table(&primes, cols);
+        let database_path = unique_checkpoint_path("previous-depth-paths").with_extension("db");
+        let prefix = vec![0; depth - 1];
+
+        let mut previous = State::new(primes.clone(), cols, table.clone());
+        previous
+            .set_shift_path_store(&database_path, depth - 1, true)
+            .unwrap();
+        previous
+            .shift_path_store
+            .as_ref()
+            .unwrap()
+            .append(2, &prefix)
+            .unwrap();
+        drop(previous);
+
+        let mut sequential = State::new(primes.clone(), cols, table.clone());
+        sequential.target = 0;
+        sequential
+            .set_shift_path_store(&database_path, depth, false)
+            .unwrap();
+        sequential
+            .search_with_checkpoint(depth, None, None)
+            .unwrap();
+        assert_eq!(sequential.node_count, 2);
+        assert!(sequential
+            .shifts
+            .iter()
+            .all(|path| path[..depth - 1] == prefix));
+        drop(sequential);
+
+        let mut parallel = State::new(primes, cols, table);
+        parallel.target = 0;
+        parallel
+            .set_shift_path_store(&database_path, depth, false)
+            .unwrap();
+        let result = parallel.search_parallel(depth, None, None).unwrap();
+        assert!(result.shifts.iter().all(|path| path[..depth - 1] == prefix));
+
+        drop(parallel);
+        std::fs::remove_file(database_path).unwrap();
     }
 
     #[test]
@@ -1153,7 +1301,7 @@ mod tests {
 
         state.key = vec![1, 0];
         state.node_count = 10;
-        state.max_count = 2;
+        state.max_score = 2;
         state.results = 0;
 
         let saved_stack = vec![super::Frame {
@@ -1200,6 +1348,7 @@ mod tests {
             split_depth: 0,
             completed: vec![],
             in_progress: vec![],
+            pending_prefixes: vec![],
         };
         let json = serde_json::to_string_pretty(&checkpoint).unwrap();
         assert!(json.contains("depth"));
@@ -1233,7 +1382,7 @@ mod tests {
             level: 0,
             next_idx: 2,
         }];
-        saved.write_checkpoint(&path, 1, &stack).unwrap();
+        saved.write_checkpoint(&path, 1, &stack, &[]).unwrap();
         assert!(!std::fs::read_to_string(&path).unwrap().contains('\n'));
 
         let mut resumed = State::new(primes, cols, table);
@@ -1358,6 +1507,7 @@ mod tests {
                     split_depth,
                     completed,
                     in_progress: Vec::new(),
+                    pending_prefixes: Vec::new(),
                 },
             )
             .unwrap();
@@ -1394,6 +1544,7 @@ mod tests {
                     level: 0,
                     next_idx: 2,
                 }],
+                &[],
             )
             .unwrap();
 
@@ -1432,6 +1583,7 @@ mod tests {
                     split_depth: 1,
                     completed: Vec::new(),
                     in_progress: Vec::new(),
+                    pending_prefixes: Vec::new(),
                 },
             )
             .unwrap();

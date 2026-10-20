@@ -8,7 +8,7 @@ const CREATE_SHIFT_PATHS_TABLE: &str = "
         parent_node_id INTEGER REFERENCES shift_paths(node_id),
         shift INTEGER NOT NULL,
         depth INTEGER NOT NULL,
-        max_count INTEGER NOT NULL,
+        score INTEGER NOT NULL,
         UNIQUE(parent_node_id, shift)
     );
     CREATE UNIQUE INDEX IF NOT EXISTS shift_paths_root_shift
@@ -20,7 +20,7 @@ const CREATE_SHIFT_PATH_LEAVES_TABLE: &str = "
         leaf_id INTEGER PRIMARY KEY,
         depth INTEGER NOT NULL,
         node_id INTEGER NOT NULL REFERENCES shift_paths(node_id),
-        max_count INTEGER NOT NULL,
+        max_score INTEGER NOT NULL,
         UNIQUE(depth, node_id)
     );
 ";
@@ -104,7 +104,7 @@ impl ShiftPathStore {
                 Err(rusqlite::Error::QueryReturnedNoRows) => {
                     transaction
                         .execute(
-                            "INSERT INTO shift_paths (parent_node_id, shift, depth, max_count)
+                            "INSERT INTO shift_paths (parent_node_id, shift, depth, score)
                              VALUES (?1, ?2, ?3, ?4)",
                             params![parent_node_id, shift, node_depth, max_count],
                         )
@@ -117,14 +117,14 @@ impl ShiftPathStore {
         }
         transaction
             .execute(
-                "UPDATE shift_paths SET max_count = ?1 WHERE node_id = ?2",
+                "UPDATE shift_paths SET score = ?1 WHERE node_id = ?2",
                 params![max_count, node_id],
             )
             .map_err(|error| error.to_string())?;
         if path.len() == self.depth {
             transaction
                 .execute(
-                    "INSERT OR IGNORE INTO shift_path_leaves (depth, node_id, max_count)
+                    "INSERT OR IGNORE INTO shift_path_leaves (depth, node_id, max_score)
                      VALUES (?1, ?2, ?3)",
                     params![self.depth, node_id, max_count],
                 )
@@ -171,7 +171,7 @@ impl ShiftPathStore {
                     SELECT leaves.leaf_id, nodes.node_id, nodes.parent_node_id, nodes.shift, nodes.depth
                     FROM shift_path_leaves AS leaves
                     JOIN shift_paths AS nodes ON nodes.node_id = leaves.node_id
-                    WHERE leaves.depth = ?1 AND (?2 IS NULL OR leaves.max_count = ?2)
+                    WHERE leaves.depth = ?1 AND (?2 IS NULL OR leaves.max_score = ?2)
                     UNION ALL
                     SELECT path.leaf_id, parents.node_id, parents.parent_node_id, parents.shift, parents.depth
                     FROM shift_paths AS parents
@@ -230,13 +230,13 @@ fn migrate_shift_path_schema(connection: &Connection) -> Result<(), String> {
     let paths_are_current = has_expected_schema(
         connection,
         "shift_paths",
-        &["node_id", "parent_node_id", "shift", "depth", "max_count"],
+        &["node_id", "parent_node_id", "shift", "depth", "score"],
     )
     .map_err(|error| error.to_string())?;
     let leaves_are_current = has_expected_schema(
         connection,
         "shift_path_leaves",
-        &["leaf_id", "depth", "node_id", "max_count"],
+        &["leaf_id", "depth", "node_id", "max_score"],
     )
     .map_err(|error| error.to_string())?;
     if !paths_are_current || !leaves_are_current {
@@ -300,7 +300,7 @@ mod tests {
         let connection = rusqlite::Connection::open(&path).unwrap();
         let nodes: Vec<(Option<i64>, usize, usize, usize)> = connection
             .prepare(
-                "SELECT parent_node_id, shift, depth, max_count
+                "SELECT parent_node_id, shift, depth, score
                  FROM shift_paths ORDER BY node_id",
             )
             .unwrap()

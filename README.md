@@ -156,7 +156,7 @@ cargo run --release -- --depth 10 --cols 4000 --output-dir results
 
 ## 出力ファイル形式
 
-出力ファイルは、シフトパスを `HLSearch.db`、探索結果を `result_depth8_YYYYMMDD_HHMMSS.txt` の形式で出力します。ターゲット値による枝刈りを通過したシフトパスは、探索中に SQLite の親ノード形式で逐次保存されます。`shift_paths` は各ノードの `node_id`、`parent_node_id`、`shift`、パス長の `depth`、そのノードでの `max_count` を持ち、同じ接頭辞を複数パス・複数深さで共有します。完全長パスの記録は `shift_path_leaves` が `(depth, node_id, max_count)` として管理し、読み込み時には親参照をたどってシフト列を復元します。これにより深さ 15 以上の開始パス、チェックポイント再開時の最大葉パスを重複なく保存順で読み込めます。実行開始時の初期化は対象深さの葉記録だけを削除するため、他深さのパスや共有親ノードを壊しません。旧 JSON 配列形式の `shift_paths` テーブルは、初回オープン時に新形式へ再作成されます（旧パスは移行されません）。深さ 249 でターゲット値 447 に一致したパスは、発見ごとに `target_paths` テーブルへ `(depth, target_count, target_shifts)` として追加されます。`target_paths` の主キーは `(depth, target_shifts)` です。
+出力ファイルは、シフトパスを `HLSearch.db`、探索結果を `result_depth8_YYYYMMDD_HHMMSS.txt` の形式で出力します。ターゲット値による枝刈りを通過したシフトパスは、探索中に SQLite の親ノード形式で逐次保存されます。`shift_paths` は各ノードの `node_id`、`parent_node_id`、`shift`、パス長の `depth`、そのノードでの `score` を持ち、同じ接頭辞を複数パス・複数深さで共有します。完全長パスの記録は `shift_path_leaves` が `(depth, node_id, max_score)` として管理し、読み込み時には親参照をたどってシフト列を復元します。これにより深さ 15 以上の開始パス、チェックポイント再開時の最大葉パスを重複なく保存順で読み込めます。実行開始時の初期化は対象深さの葉記録だけを削除するため、他深さのパスや共有親ノードを壊しません。旧 JSON 配列形式と `max_count` 列を持つ旧形式の `shift_paths` テーブル、および `max_count` 列を持つ旧形式の `shift_path_leaves` テーブルは、初回オープン時に新形式へ再作成されます（旧パスは移行されません）。深さ 249 でターゲット値 447 に一致したパスは、発見ごとに `target_paths` テーブルへ `(depth, target_count, target_shifts)` として追加されます。`target_paths` の主キーは `(depth, target_shifts)` です。
 
 ファイルには実行時設定（`config`）と探索結果（`result`）を含むJSONオブジェクトが出力されます。
 

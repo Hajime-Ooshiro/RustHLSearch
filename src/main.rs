@@ -40,6 +40,7 @@ struct OutputConfig<'a> {
 struct OutputResult {
     max_score: usize,
     results: usize,
+    shifts: Vec<Vec<usize>>,
     target_count: usize,
     target_shifts: Vec<Vec<usize>>,
 }
@@ -164,6 +165,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             state.shifts = result.shifts;
             state.target_count = result.target_count;
             state.target_shifts = result.target_shifts;
+            state.node_count = result.node_count;
             completed
         }
     };
@@ -215,6 +217,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         result: OutputResult {
             max_score: state.max_score,
             results: state.results,
+            shifts: state.shifts,
             target_count: state.target_count,
             target_shifts: state.target_shifts,
         },
@@ -273,5 +276,19 @@ mod tests {
             cli.validate(3).unwrap_err(),
             "depth (4) cannot exceed available primes (3)"
         );
+    }
+
+    #[test]
+    fn output_result_serializes_best_score_shifts() {
+        let json = serde_json::to_value(OutputResult {
+            max_score: 447,
+            results: 1,
+            shifts: vec![vec![1, 1, 4]],
+            target_count: 0,
+            target_shifts: Vec::new(),
+        })
+        .unwrap();
+
+        assert_eq!(json["shifts"], serde_json::json!([[1, 1, 4]]));
     }
 }

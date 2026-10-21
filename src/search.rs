@@ -68,6 +68,10 @@ struct Checkpoint {
     in_progress: Vec<ParallelInProgress>,
     #[serde(default)]
     pending_prefixes: ShiftPaths,
+    #[serde(default)]
+    work_prefixes: Option<ShiftPaths>,
+    #[serde(default)]
+    config_hash: u64,
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, clap::ValueEnum, Deserialize, Serialize)]
@@ -85,6 +89,7 @@ pub struct SharedResults {
     pub shifts: Vec<Vec<usize>>,
     pub target_count: usize,
     pub target_shifts: Vec<Vec<usize>>,
+    pub node_count: u64,
 }
 
 struct ParallelResults {
@@ -161,6 +166,7 @@ struct ParallelProgress {
 struct ParallelSearchCtx<'a> {
     depth: usize,
     split_depth: usize,
+    work_prefixes: &'a ShiftPaths,
     results: &'a ParallelResults,
     node_count: &'a AtomicU64,
     progress: &'a Mutex<ParallelProgress>,
@@ -262,8 +268,10 @@ impl State {
         depth: usize,
         clear_existing: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let config_hash = self.compute_config_hash();
         self.shift_path_store = Some(
-            ShiftPathStore::create(path, depth, clear_existing).map_err(std::io::Error::other)?,
+            ShiftPathStore::create(path, depth, clear_existing, config_hash)
+                .map_err(std::io::Error::other)?,
         );
         Ok(())
     }
@@ -560,6 +568,8 @@ impl State {
                 completed: Vec::new(),
                 in_progress: Vec::new(),
                 pending_prefixes: pending_prefixes.to_vec(),
+                work_prefixes: None,
+                config_hash: self.compute_config_hash(),
             },
         )
     }
@@ -604,7 +614,30 @@ impl State {
             )
             .into());
         }
+        let current_hash = self.compute_config_hash();
+        if checkpoint.config_hash != 0 && checkpoint.config_hash != current_hash {
+            return Err(
+                format!(
+                    "チェックポイントの設定が異なります。別の --output-dir を使用してください (checkpoint_hash={}, current_hash={})",
+                    checkpoint.config_hash, current_hash
+                )
+                .into(),
+            );
+        }
         Ok(())
+    }
+
+    fn compute_config_hash(&self) -> u64 {
+        let mut hash = 0u64;
+        hash = hash.wrapping_mul(31).wrapping_add(self.primes.len() as u64);
+        for &p in &self.primes {
+            hash = hash.wrapping_mul(31).wrapping_add(p as u64);
+        }
+        hash = hash
+            .wrapping_mul(31)
+            .wrapping_add(self.zero_mask.size() as u64);
+        hash = hash.wrapping_mul(31).wrapping_add(self.target as u64);
+        hash
     }
 
     fn restore_stack(
@@ -666,6 +699,7 @@ impl State {
         });
 
         let mut split_depth = self.parallel_split_depth(depth);
+        let mut checkpoint_work_prefixes = None;
         if let Some(path) = resume_path {
             let checkpoint = Self::load_checkpoint(path)?;
             if checkpoint.mode != SearchMode::Parallel {
@@ -678,6 +712,7 @@ impl State {
                 return Err("チェックポイントの split_depth が depth を超えています".into());
             }
             split_depth = checkpoint.split_depth;
+            checkpoint_work_prefixes = checkpoint.work_prefixes;
             node_count.store(checkpoint.node_count, Ordering::Relaxed);
             results
                 .max_score
@@ -695,6 +730,7 @@ impl State {
                 shifts,
                 target_count: checkpoint.target_count,
                 target_shifts,
+                node_count: checkpoint.node_count,
             };
             {
                 let mut progress = progress.lock().unwrap();
@@ -712,14 +748,12 @@ impl State {
             );
         }
 
-        let previous_paths = self.load_previous_depth_paths(depth)?;
-        let work_items = if let Some(previous_paths) = previous_paths {
+        let work_items = if let Some(work_prefixes) = checkpoint_work_prefixes {
+            self.work_items_from_prefixes(depth, work_prefixes)?
+        } else if resume_path.is_some() {
+            self.parallel_work_items(split_depth)?
+        } else if let Some(previous_paths) = self.load_previous_depth_paths(depth)? {
             if split_depth != depth - 1 {
-                if resume_path.is_some() {
-                    return Err(
-                        "前深さパスを使用する探索のチェックポイント split_depth が不正です".into(),
-                    );
-                }
                 split_depth = depth - 1;
             }
             let work_items = self.previous_depth_work_items(depth, previous_paths)?;
@@ -733,6 +767,10 @@ impl State {
         } else {
             self.parallel_work_items(split_depth)?
         };
+        let work_prefixes = work_items
+            .iter()
+            .map(|work_item| work_item.key.clone())
+            .collect();
         let jobs = {
             let progress = progress.lock().unwrap();
             self.parallel_jobs(&work_items, &progress)?
@@ -741,6 +779,7 @@ impl State {
         let ctx = ParallelSearchCtx {
             depth,
             split_depth,
+            work_prefixes: &work_prefixes,
             results: results.as_ref(),
             node_count: node_count.as_ref(),
             progress: &progress,
@@ -769,7 +808,9 @@ impl State {
         if ctx.checkpoint_path.is_some() {
             self.write_parallel_checkpoint(&ctx, true, false)?;
         }
-        Ok((results.snapshot(), !interrupted.load(Ordering::SeqCst)))
+        let mut shared = results.snapshot();
+        shared.node_count = node_count.load(Ordering::Relaxed);
+        Ok((shared, !interrupted.load(Ordering::SeqCst)))
     }
 
     fn parallel_jobs(
@@ -1021,6 +1062,8 @@ impl State {
                 completed,
                 in_progress,
                 pending_prefixes: Vec::new(),
+                work_prefixes: Some(ctx.work_prefixes.clone()),
+                config_hash: self.compute_config_hash(),
             },
         )
         .map_err(|err| err.to_string())?;
@@ -1075,21 +1118,31 @@ impl State {
         depth: usize,
         paths: ShiftPaths,
     ) -> Result<Vec<WorkItem>, String> {
-        let mut work_items = Vec::with_capacity(paths.len());
-        for key in paths {
+        self.work_items_from_prefixes(depth, paths)
+    }
+
+    fn work_items_from_prefixes(
+        &self,
+        depth: usize,
+        prefixes: ShiftPaths,
+    ) -> Result<Vec<WorkItem>, String> {
+        let mut work_items = Vec::with_capacity(prefixes.len());
+        for key in prefixes {
+            if key.is_empty() || key.len() > depth {
+                return Err(format!("チェックポイントの開始パス長が不正です: {:?}", key));
+            }
             if key
                 .iter()
                 .enumerate()
                 .any(|(level, &shift)| shift >= self.primes[level])
             {
                 return Err(format!(
-                    "depth={} の保存済みシフトパスに範囲外の値が含まれています: {:?}",
-                    depth - 1,
+                    "保存済みシフトパスに範囲外の値が含まれています: {:?}",
                     key
                 ));
             }
             let masks = self.rebuild_masks(depth, &key);
-            let base_mask = masks[depth - 1].clone();
+            let base_mask = masks[key.len()].clone();
             let count = base_mask.count_ones();
             if count < self.target {
                 continue;
@@ -1263,10 +1316,31 @@ mod tests {
         parallel
             .set_shift_path_store(&database_path, depth, false)
             .unwrap();
-        let result = parallel.search_parallel(depth, None, None).unwrap();
+        let checkpoint_path = unique_checkpoint_path("previous-depth-parallel");
+        let result = parallel
+            .search_parallel(depth, Some(&checkpoint_path), None)
+            .unwrap();
         assert!(result.shifts.iter().all(|path| path[..depth - 1] == prefix));
 
         drop(parallel);
+        let mut resumed = State::new(vec![2; depth], cols, build_shift_table(&[2; 2], cols));
+        resumed.target = 0;
+        resumed
+            .set_shift_path_store(&database_path, depth, false)
+            .unwrap();
+        let resumed_result = resumed
+            .search_parallel(depth, Some(&checkpoint_path), Some(&checkpoint_path))
+            .unwrap();
+        assert_eq!(resumed_result.shifts, result.shifts);
+        assert!(resumed_result
+            .shifts
+            .iter()
+            .all(|path| path[..depth - 1] == prefix));
+
+        let backup_path = checkpoint_path.with_extension("bak");
+        let _ = std::fs::remove_file(checkpoint_path);
+        let _ = std::fs::remove_file(backup_path);
+        drop(resumed);
         std::fs::remove_file(database_path).unwrap();
     }
 
@@ -1418,6 +1492,8 @@ mod tests {
             completed: vec![],
             in_progress: vec![],
             pending_prefixes: vec![],
+            work_prefixes: None,
+            config_hash: 0,
         };
         let json = serde_json::to_string_pretty(&checkpoint).unwrap();
         assert!(json.contains("depth"));
@@ -1525,6 +1601,7 @@ mod tests {
         assert_eq!(result.max_score, expected.max_score);
         assert_eq!(result.results, expected.results);
         assert_eq!(result.shifts.len(), expected.results);
+        assert_eq!(result.node_count, expected.node_count);
 
         let backup_path = path.with_extension("bak");
         let _ = std::fs::remove_file(&path);
@@ -1577,11 +1654,14 @@ mod tests {
                     completed,
                     in_progress: Vec::new(),
                     pending_prefixes: Vec::new(),
+                    work_prefixes: None,
+                    config_hash: state.compute_config_hash(),
                 },
             )
             .unwrap();
 
         let mut resumed = State::new(primes, cols, table);
+        resumed.target = 0;
         resumed
             .set_shift_path_store(&database_path, depth, false)
             .unwrap();
@@ -1653,6 +1733,8 @@ mod tests {
                     completed: Vec::new(),
                     in_progress: Vec::new(),
                     pending_prefixes: Vec::new(),
+                    work_prefixes: None,
+                    config_hash: 0,
                 },
             )
             .unwrap();

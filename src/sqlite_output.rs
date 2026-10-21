@@ -14,6 +14,13 @@ const CREATE_TARGET_PATHS_TABLE: &str = "
     );
 ";
 
+const CREATE_CONFIG_TABLE: &str = "
+    CREATE TABLE IF NOT EXISTS search_config (
+        depth INTEGER PRIMARY KEY,
+        config_hash INTEGER NOT NULL
+    );
+";
+
 fn shift_path_table(depth: usize) -> String {
     format!("depth_{depth:03}")
 }
@@ -48,7 +55,12 @@ pub struct ShiftPathStore {
 }
 
 impl ShiftPathStore {
-    pub fn create(path: &Path, depth: usize, clear_existing: bool) -> Result<Self, String> {
+    pub fn create(
+        path: &Path,
+        depth: usize,
+        clear_existing: bool,
+        config_hash: u64,
+    ) -> Result<Self, String> {
         let connection = Connection::open(path).map_err(|error| error.to_string())?;
         connection
             .execute_batch("PRAGMA foreign_keys = ON;")
@@ -63,6 +75,9 @@ impl ShiftPathStore {
         connection
             .execute_batch(CREATE_TARGET_PATHS_TABLE)
             .map_err(|error| error.to_string())?;
+        connection
+            .execute_batch(CREATE_CONFIG_TABLE)
+            .map_err(|error| error.to_string())?;
         if !has_expected_schema(&connection, "target_paths", &["depth", "target_shifts"])
             .map_err(|error| error.to_string())?
         {
@@ -72,11 +87,13 @@ impl ShiftPathStore {
                 ))
                 .map_err(|error| error.to_string())?;
         }
+        check_config_hash(&connection, depth, config_hash)?;
         if clear_existing {
             connection
                 .execute("DELETE FROM target_paths WHERE depth = ?1", params![depth])
                 .map_err(|error| error.to_string())?;
         }
+        store_config_hash(&connection, depth, config_hash)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
             depth,
@@ -255,6 +272,44 @@ fn drop_legacy_depth_tables(connection: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+fn check_config_hash(
+    connection: &Connection,
+    depth: usize,
+    config_hash: u64,
+) -> Result<(), String> {
+    let existing: Option<i64> = connection
+        .query_row(
+            "SELECT config_hash FROM search_config WHERE depth = ?1",
+            params![depth as i64],
+            |row| row.get(0),
+        )
+        .ok();
+
+    if let Some(stored_hash) = existing {
+        if stored_hash as u64 != config_hash {
+            return Err(format!(
+                "設定ハッシュが異なります。別の --output-dir を使用してください (stored_hash={}, current_hash={})",
+                stored_hash, config_hash
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn store_config_hash(
+    connection: &Connection,
+    depth: usize,
+    config_hash: u64,
+) -> Result<(), String> {
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO search_config (depth, config_hash) VALUES (?1, ?2)",
+            params![depth as i64, config_hash as i64],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 fn load_node_map(
     connection: &Connection,
     table: &str,
@@ -316,7 +371,7 @@ mod tests {
     #[test]
     fn appends_reusable_parent_nodes_and_reconstructs_leaves_in_order() {
         let path = database_path();
-        let store = ShiftPathStore::create(&path, 2, true).unwrap();
+        let store = ShiftPathStore::create(&path, 2, true, 12345).unwrap();
         store.append(10, &[1]).unwrap();
         store.append(10, &[1, 2]).unwrap();
         store.append(11, &[1, 3]).unwrap();
@@ -357,7 +412,7 @@ mod tests {
     #[test]
     fn prefixes_are_stored_in_their_own_depth_tables() {
         let path = database_path();
-        let store = ShiftPathStore::create(&path, 3, true).unwrap();
+        let store = ShiftPathStore::create(&path, 3, true, 12345).unwrap();
         store.append(4, &[1, 2, 3]).unwrap();
 
         assert_eq!(store.load_full_depth_paths(1).unwrap(), vec![vec![1]]);
@@ -372,12 +427,12 @@ mod tests {
     #[test]
     fn clearing_a_depth_keeps_stored_paths_and_removes_its_targets() {
         let path = database_path();
-        let store = ShiftPathStore::create(&path, 2, true).unwrap();
+        let store = ShiftPathStore::create(&path, 2, true, 12345).unwrap();
         store.append(3, &[1, 2]).unwrap();
         store.append_target(3, &[1, 2]).unwrap();
         drop(store);
 
-        let store = ShiftPathStore::create(&path, 2, true).unwrap();
+        let store = ShiftPathStore::create(&path, 2, true, 12345).unwrap();
         assert_eq!(store.load_full_depth_paths(2).unwrap(), vec![vec![1, 2]]);
         assert!(store.load_target_paths().unwrap().is_empty());
 
@@ -401,7 +456,7 @@ mod tests {
             .unwrap();
         drop(connection);
 
-        let store = ShiftPathStore::create(&path, 2, true).unwrap();
+        let store = ShiftPathStore::create(&path, 2, true, 12345).unwrap();
         store.append(10, &[1, 2]).unwrap();
         assert_eq!(store.load_full_depth_paths(2).unwrap(), vec![vec![1, 2]]);
 
@@ -429,7 +484,7 @@ mod tests {
             .unwrap();
         drop(connection);
 
-        let store = ShiftPathStore::create(&path, 2, true).unwrap();
+        let store = ShiftPathStore::create(&path, 2, true, 12345).unwrap();
         store.append(10, &[1, 2]).unwrap();
         assert_eq!(store.load_full_depth_paths(2).unwrap(), vec![vec![1, 2]]);
 

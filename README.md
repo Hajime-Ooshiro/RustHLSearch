@@ -135,7 +135,7 @@ cargo run --release -- --depth 10 --cols 4000 --output-dir results
    - 途中の累積 popcount が固定ターゲット値 `447` 未満になった枝は即座に枝刈りします。
    - 各素数のシフト探索は降順（$p-1 \dots 0$）に進めます。
 4. **葉ノード（深さ `depth`）の判定**:
-   - popcount がこれまでの最大値を超えた場合、`max_count` と記録済みパスを更新します。
+   - popcount がこれまでの最大値を超えた場合、`max_score` と記録済みパスを更新します。
 
 ### 探索モード
 
@@ -169,7 +169,7 @@ cargo run --release -- --depth 10 --cols 4000 --output-dir results
     "elapsed": "1.234567s"
   },
   "result": {
-    "max_count": 447,
+    "max_score": 447,
     "results": 1,
     "shifts": [[1, 1, 4, 3, 5, 10, 1, 9]],
     "target_count": 0,
@@ -179,9 +179,9 @@ cargo run --release -- --depth 10 --cols 4000 --output-dir results
 ```
 
 - `config`: 実行時設定と経過時間
-- `result.max_count`: 全探索で到達した葉ノードの最大 popcount
-- `result.results`: `max_count` に一致するパスの個数
-- `result.shifts`: `max_count` に一致するシフト列の配列
+- `result.max_score`: 全探索で到達した葉ノードの最大 popcount
+- `result.results`: `max_score` に一致するパスの個数
+- `result.shifts`: `max_score` に一致するシフト列の配列
 - `result.target_count`: 深さ 249 で popcount がターゲット値 447 に一致したパスの個数
 - `result.target_shifts`: 上記のシフト列の配列
 

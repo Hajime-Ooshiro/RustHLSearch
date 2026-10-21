@@ -1203,6 +1203,10 @@ mod tests {
         state.search_with_checkpoint(2, None, None).unwrap();
 
         let connection = rusqlite::Connection::open(&path).unwrap();
+        let roots: usize = connection
+            .query_row("SELECT COUNT(*) FROM depth_001", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(roots, 2);
         let nodes: Vec<(Option<i64>, usize)> = connection
             .prepare("SELECT parent_node_id, shift FROM depth_002 ORDER BY node_id")
             .unwrap()
@@ -1210,23 +1214,8 @@ mod tests {
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        assert_eq!(nodes.len(), 8);
-        assert_eq!(
-            nodes.iter().filter(|(parent, _)| parent.is_none()).count(),
-            2
-        );
-        assert_eq!(
-            nodes.iter().filter(|(parent, _)| parent.is_some()).count(),
-            6
-        );
-        let leaves: usize = connection
-            .query_row(
-                "SELECT COUNT(*) FROM depth_002 WHERE is_leaf = 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(leaves, 6);
+        assert_eq!(nodes.len(), 6);
+        assert!(nodes.iter().all(|(parent, _)| parent.is_some()));
 
         drop(connection);
         drop(state);

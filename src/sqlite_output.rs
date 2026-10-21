@@ -2,29 +2,6 @@ use rusqlite::{params, Connection};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-const CREATE_SHIFT_PATHS_TABLE: &str = "
-    CREATE TABLE IF NOT EXISTS shift_paths (
-        node_id INTEGER PRIMARY KEY,
-        parent_node_id INTEGER REFERENCES shift_paths(node_id),
-        shift INTEGER NOT NULL,
-        depth INTEGER NOT NULL,
-        score INTEGER NOT NULL,
-        UNIQUE(parent_node_id, shift)
-    );
-    CREATE UNIQUE INDEX IF NOT EXISTS shift_paths_root_shift
-        ON shift_paths(shift) WHERE parent_node_id IS NULL;
-";
-
-const CREATE_SHIFT_PATH_LEAVES_TABLE: &str = "
-    CREATE TABLE IF NOT EXISTS shift_path_leaves (
-        leaf_id INTEGER PRIMARY KEY,
-        depth INTEGER NOT NULL,
-        node_id INTEGER NOT NULL REFERENCES shift_paths(node_id),
-        max_score INTEGER NOT NULL,
-        UNIQUE(depth, node_id)
-    );
-";
-
 const CREATE_TARGET_PATHS_TABLE: &str = "
     CREATE TABLE IF NOT EXISTS target_paths (
         depth INTEGER NOT NULL,
@@ -34,10 +11,32 @@ const CREATE_TARGET_PATHS_TABLE: &str = "
     );
 ";
 
+fn shift_path_table(depth: usize) -> String {
+    format!("depth_{depth:03}")
+}
+
+fn create_shift_path_table_sql(table: &str) -> String {
+    format!(
+        "
+    CREATE TABLE IF NOT EXISTS {table} (
+        node_id INTEGER PRIMARY KEY,
+        parent_node_id INTEGER REFERENCES {table}(node_id),
+        shift INTEGER NOT NULL,
+        score INTEGER NOT NULL,
+        is_leaf INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(parent_node_id, shift)
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS {table}_root_shift
+        ON {table}(shift) WHERE parent_node_id IS NULL;
+"
+    )
+}
+
 #[derive(Clone)]
 pub struct ShiftPathStore {
     connection: Arc<Mutex<Connection>>,
     depth: usize,
+    table: String,
 }
 
 impl ShiftPathStore {
@@ -46,7 +45,20 @@ impl ShiftPathStore {
         connection
             .execute_batch("PRAGMA foreign_keys = ON;")
             .map_err(|error| error.to_string())?;
-        migrate_shift_path_schema(&connection)?;
+        drop_legacy_shift_path_tables(&connection)?;
+        let table = shift_path_table(depth);
+        connection
+            .execute_batch(&create_shift_path_table_sql(&table))
+            .map_err(|error| error.to_string())?;
+        if !has_expected_schema(&connection, &table, &["is_leaf"])
+            .map_err(|error| error.to_string())?
+        {
+            connection
+                .execute_batch(&format!(
+                    "ALTER TABLE {table} ADD COLUMN is_leaf INTEGER NOT NULL DEFAULT 0;"
+                ))
+                .map_err(|error| error.to_string())?;
+        }
         connection
             .execute_batch(CREATE_TARGET_PATHS_TABLE)
             .map_err(|error| error.to_string())?;
@@ -60,12 +72,11 @@ impl ShiftPathStore {
                 .map_err(|error| error.to_string())?;
         }
         if clear_existing {
-            // Leaves identify the full paths belonging to a completed search. Nodes are shared
-            // prefixes, so retaining them keeps other depths valid and cannot leave dangling rows.
+            // 接頭辞ノードは再利用されるため残し、完全長パスの印だけを外す。
             connection
                 .execute(
-                    "DELETE FROM shift_path_leaves WHERE depth = ?1",
-                    params![depth],
+                    &format!("UPDATE {table} SET is_leaf = 0 WHERE is_leaf = 1"),
+                    [],
                 )
                 .map_err(|error| error.to_string())?;
             connection
@@ -75,6 +86,7 @@ impl ShiftPathStore {
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
             depth,
+            table,
         })
     }
 
@@ -92,11 +104,12 @@ impl ShiftPathStore {
         let mut parent_node_id = None;
         let mut node_id = 0_i64;
 
-        for (index, &shift) in path.iter().enumerate() {
-            let node_depth = index + 1;
+        for &shift in path {
             node_id = match transaction.query_row(
-                "SELECT node_id FROM shift_paths
-                 WHERE parent_node_id IS ?1 AND shift = ?2",
+                &format!(
+                    "SELECT node_id FROM {} WHERE parent_node_id IS ?1 AND shift = ?2",
+                    self.table
+                ),
                 params![parent_node_id, shift],
                 |row| row.get(0),
             ) {
@@ -104,9 +117,11 @@ impl ShiftPathStore {
                 Err(rusqlite::Error::QueryReturnedNoRows) => {
                     transaction
                         .execute(
-                            "INSERT INTO shift_paths (parent_node_id, shift, depth, score)
-                             VALUES (?1, ?2, ?3, ?4)",
-                            params![parent_node_id, shift, node_depth, max_count],
+                            &format!(
+                                "INSERT INTO {} (parent_node_id, shift, score) VALUES (?1, ?2, ?3)",
+                                self.table
+                            ),
+                            params![parent_node_id, shift, max_count],
                         )
                         .map_err(|error| error.to_string())?;
                     transaction.last_insert_rowid()
@@ -117,19 +132,13 @@ impl ShiftPathStore {
         }
         transaction
             .execute(
-                "UPDATE shift_paths SET score = ?1 WHERE node_id = ?2",
-                params![max_count, node_id],
+                &format!(
+                    "UPDATE {} SET score = ?1, is_leaf = ?2 WHERE node_id = ?3",
+                    self.table
+                ),
+                params![max_count, path.len() == self.depth, node_id],
             )
             .map_err(|error| error.to_string())?;
-        if path.len() == self.depth {
-            transaction
-                .execute(
-                    "INSERT OR IGNORE INTO shift_path_leaves (depth, node_id, max_score)
-                     VALUES (?1, ?2, ?3)",
-                    params![self.depth, node_id, max_count],
-                )
-                .map_err(|error| error.to_string())?;
-        }
         transaction.commit().map_err(|error| error.to_string())
     }
 
@@ -161,27 +170,30 @@ impl ShiftPathStore {
         depth: usize,
         max_count: Option<usize>,
     ) -> Result<Vec<Vec<usize>>, String> {
+        let table = shift_path_table(depth);
         let connection = self
             .connection
             .lock()
             .map_err(|_| "SQLite 出力のロック取得に失敗しました".to_string())?;
+        if !table_exists(&connection, &table).map_err(|error| error.to_string())? {
+            return Ok(Vec::new());
+        }
         let mut statement = connection
-            .prepare(
-                "WITH RECURSIVE path(leaf_id, node_id, parent_node_id, shift, depth) AS (
-                    SELECT leaves.leaf_id, nodes.node_id, nodes.parent_node_id, nodes.shift, nodes.depth
-                    FROM shift_path_leaves AS leaves
-                    JOIN shift_paths AS nodes ON nodes.node_id = leaves.node_id
-                    WHERE leaves.depth = ?1 AND (?2 IS NULL OR leaves.max_score = ?2)
+            .prepare(&format!(
+                "WITH RECURSIVE path(leaf_id, node_id, parent_node_id, shift, steps) AS (
+                    SELECT node_id, node_id, parent_node_id, shift, 0
+                    FROM {table}
+                    WHERE is_leaf = 1 AND (?1 IS NULL OR score = ?1)
                     UNION ALL
-                    SELECT path.leaf_id, parents.node_id, parents.parent_node_id, parents.shift, parents.depth
-                    FROM shift_paths AS parents
+                    SELECT path.leaf_id, parents.node_id, parents.parent_node_id, parents.shift, path.steps + 1
+                    FROM {table} AS parents
                     JOIN path ON path.parent_node_id = parents.node_id
                 )
-                SELECT leaf_id, shift FROM path ORDER BY leaf_id, depth",
-            )
+                SELECT leaf_id, shift FROM path ORDER BY leaf_id, steps DESC"
+            ))
             .map_err(|error| error.to_string())?;
         let rows = statement
-            .query_map(params![depth, max_count], |row| {
+            .query_map(params![max_count], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, usize>(1)?))
             })
             .map_err(|error| error.to_string())?;
@@ -226,31 +238,18 @@ impl ShiftPathStore {
     }
 }
 
-fn migrate_shift_path_schema(connection: &Connection) -> Result<(), String> {
-    let paths_are_current = has_expected_schema(
-        connection,
-        "shift_paths",
-        &["node_id", "parent_node_id", "shift", "depth", "score"],
-    )
-    .map_err(|error| error.to_string())?;
-    let leaves_are_current = has_expected_schema(
-        connection,
-        "shift_path_leaves",
-        &["leaf_id", "depth", "node_id", "max_score"],
-    )
-    .map_err(|error| error.to_string())?;
-    if !paths_are_current || !leaves_are_current {
-        connection
-            .execute_batch(
-                "DROP TABLE IF EXISTS shift_path_leaves; DROP TABLE IF EXISTS shift_paths;",
-            )
-            .map_err(|error| error.to_string())?;
-    }
+fn drop_legacy_shift_path_tables(connection: &Connection) -> Result<(), String> {
     connection
-        .execute_batch(&format!(
-            "{CREATE_SHIFT_PATHS_TABLE}{CREATE_SHIFT_PATH_LEAVES_TABLE}"
-        ))
+        .execute_batch("DROP TABLE IF EXISTS shift_path_leaves; DROP TABLE IF EXISTS shift_paths;")
         .map_err(|error| error.to_string())
+}
+
+fn table_exists(connection: &Connection, table: &str) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        params![table],
+        |row| row.get(0),
+    )
 }
 
 fn has_expected_schema(
@@ -298,20 +297,18 @@ mod tests {
         assert_eq!(store.load_result_paths(11).unwrap(), vec![vec![1, 3]]);
 
         let connection = rusqlite::Connection::open(&path).unwrap();
-        let nodes: Vec<(Option<i64>, usize, usize, usize)> = connection
+        let nodes: Vec<(Option<i64>, usize, usize)> = connection
             .prepare(
-                "SELECT parent_node_id, shift, depth, score
-                 FROM shift_paths ORDER BY node_id",
+                "SELECT parent_node_id, shift, score
+                 FROM depth_002 ORDER BY node_id",
             )
             .unwrap()
-            .query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .unwrap()
             .map(Result::unwrap)
             .collect();
         assert_eq!(nodes.len(), 3);
-        assert_eq!(nodes[0], (None, 1, 1, 10));
+        assert_eq!(nodes[0], (None, 1, 10));
         assert!(nodes[1].0.is_some() && nodes[2].0 == nodes[1].0);
         assert_eq!(nodes[1].1, 2);
         assert_eq!(nodes[2].1, 3);

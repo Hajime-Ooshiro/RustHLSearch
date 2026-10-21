@@ -21,6 +21,8 @@ const CREATE_CONFIG_TABLE: &str = "
     );
 ";
 
+type PendingAppends = Vec<(usize, Vec<usize>)>;
+
 fn shift_path_table(depth: usize) -> String {
     format!("depth_{depth:03}")
 }
@@ -52,6 +54,7 @@ fn create_shift_path_table_sql(depth: usize) -> String {
 pub struct ShiftPathStore {
     connection: Arc<Mutex<Connection>>,
     depth: usize,
+    pending_appends: Arc<Mutex<PendingAppends>>,
 }
 
 impl ShiftPathStore {
@@ -97,6 +100,7 @@ impl ShiftPathStore {
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
             depth,
+            pending_appends: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -104,6 +108,24 @@ impl ShiftPathStore {
         if path.is_empty() {
             return Ok(());
         }
+        let mut buffer = self
+            .pending_appends
+            .lock()
+            .map_err(|_| "バッファのロック取得に失敗しました".to_string())?;
+        buffer.push((max_count, path.to_vec()));
+        Ok(())
+    }
+
+    pub fn flush(&self) -> Result<(), String> {
+        let mut buffer = self
+            .pending_appends
+            .lock()
+            .map_err(|_| "バッファのロック取得に失敗しました".to_string())?;
+
+        if buffer.is_empty() {
+            return Ok(());
+        }
+
         let mut connection = self
             .connection
             .lock()
@@ -111,40 +133,42 @@ impl ShiftPathStore {
         let transaction = connection
             .transaction()
             .map_err(|error| error.to_string())?;
-        let mut parent_node_id = None;
 
-        for (level, &shift) in path.iter().enumerate() {
-            let table = shift_path_table(level + 1);
-            let node_id = match transaction.query_row(
-                &format!("SELECT node_id FROM {table} WHERE parent_node_id IS ?1 AND shift = ?2"),
-                params![parent_node_id, shift],
-                |row| row.get(0),
-            ) {
-                Ok(id) => id,
-                Err(rusqlite::Error::QueryReturnedNoRows) => {
-                    transaction
-                        .execute(
-                            &format!(
-                                "INSERT INTO {table} (parent_depth, parent_node_id, shift, score) VALUES (?1, ?2, ?3, ?4)"
-                            ),
-                            params![level, parent_node_id, shift, max_count],
-                        )
-                        .map_err(|error| error.to_string())?;
-                    transaction.last_insert_rowid()
-                }
-                Err(error) => return Err(error.to_string()),
-            };
-            parent_node_id = Some(node_id);
+        for (max_count, path) in buffer.drain(..) {
+            let mut parent_node_id = None;
+
+            for (level, &shift) in path.iter().enumerate() {
+                let table = shift_path_table(level + 1);
+                transaction
+                    .execute(
+                        &format!(
+                            "INSERT OR IGNORE INTO {table} (parent_depth, parent_node_id, shift, score) VALUES (?1, ?2, ?3, ?4)"
+                        ),
+                        params![level as i64, parent_node_id, shift as i64, max_count as i64],
+                    )
+                    .map_err(|error| error.to_string())?;
+                let node_id: i64 = transaction
+                    .query_row(
+                        &format!(
+                            "SELECT node_id FROM {table} WHERE parent_node_id IS ?1 AND shift = ?2"
+                        ),
+                        params![parent_node_id, shift as i64],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                parent_node_id = Some(node_id);
+            }
+            transaction
+                .execute(
+                    &format!(
+                        "UPDATE {} SET score = ?1 WHERE node_id = ?2",
+                        shift_path_table(path.len())
+                    ),
+                    params![max_count as i64, parent_node_id],
+                )
+                .map_err(|error| error.to_string())?;
         }
-        transaction
-            .execute(
-                &format!(
-                    "UPDATE {} SET score = ?1 WHERE node_id = ?2",
-                    shift_path_table(path.len())
-                ),
-                params![max_count, parent_node_id],
-            )
-            .map_err(|error| error.to_string())?;
+
         transaction.commit().map_err(|error| error.to_string())
     }
 
@@ -156,7 +180,7 @@ impl ShiftPathStore {
             .map_err(|_| "SQLite 出力のロック取得に失敗しました".to_string())?;
         connection
             .execute(
-                "INSERT INTO target_paths (depth, target_count, target_shifts) VALUES (?1, ?2, ?3)",
+                "INSERT OR IGNORE INTO target_paths (depth, target_count, target_shifts) VALUES (?1, ?2, ?3)",
                 params![self.depth, target_count, target_shifts],
             )
             .map_err(|error| error.to_string())?;
@@ -176,6 +200,7 @@ impl ShiftPathStore {
         depth: usize,
         max_count: Option<usize>,
     ) -> Result<Vec<Vec<usize>>, String> {
+        self.flush()?;
         let table = shift_path_table(depth);
         let connection = self
             .connection
@@ -221,6 +246,7 @@ impl ShiftPathStore {
     }
 
     pub fn load_target_paths(&self) -> Result<Vec<Vec<usize>>, String> {
+        self.flush()?;
         let connection = self
             .connection
             .lock()
@@ -238,6 +264,12 @@ impl ShiftPathStore {
                 .map_err(|error| error.to_string())
         })
         .collect()
+    }
+}
+
+impl Drop for ShiftPathStore {
+    fn drop(&mut self) {
+        let _ = self.flush();
     }
 }
 

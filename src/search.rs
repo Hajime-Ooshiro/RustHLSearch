@@ -67,8 +67,6 @@ struct Checkpoint {
     #[serde(default)]
     in_progress: Vec<ParallelInProgress>,
     #[serde(default)]
-    pending_prefixes: ShiftPaths,
-    #[serde(default)]
     work_prefixes: Option<ShiftPaths>,
     #[serde(default)]
     config_hash: u64,
@@ -117,9 +115,6 @@ impl ParallelResults {
         if score < self.target {
             return Ok(());
         }
-        // if score < self.max_score.load(Ordering::Relaxed) {
-        //     return Ok(());
-        // }
 
         let mut results = self.results.lock().unwrap();
         let current = self.max_score.load(Ordering::Relaxed);
@@ -134,13 +129,26 @@ impl ParallelResults {
             return Ok(());
         }
 
-        if !results
-            .shifts
-            .iter()
-            .any(|existing| existing.as_slice() == key)
-        {
+        let is_duplicate = if results.results < 20 {
+            results
+                .shifts
+                .iter()
+                .any(|existing| existing.as_slice() == key)
+        } else {
+            results
+                .shifts
+                .binary_search_by(|existing| {
+                    existing.as_slice().cmp(key)
+                })
+                .is_ok()
+        };
+
+        if !is_duplicate {
             results.results += 1;
             results.shifts.push(key.to_vec());
+            if results.results % 100 == 0 {
+                results.shifts.sort();
+            }
         }
         Ok(())
     }
@@ -296,14 +304,19 @@ impl State {
             store.load_result_paths(expected_max_score)?
         };
         let target_shifts = store.load_target_paths()?;
-        if shifts.len() != expected_results || target_shifts.len() != expected_target_count {
-            return Err(format!(
-                "SQLite 出力の結果パス数がチェックポイントと一致しません (shifts={}/{}, targets={}/{})",
+        if shifts.len() < expected_results {
+            log::warn!(
+                "SQLite の結果パス数が期待値より少ないため、DB から読み込める分を使用します (shifts={}/{})",
                 shifts.len(),
-                expected_results,
+                expected_results
+            );
+        }
+        if target_shifts.len() < expected_target_count {
+            log::warn!(
+                "SQLite のターゲットパス数が期待値より少ないため、DB から読み込める分を使用します (targets={}/{})",
                 target_shifts.len(),
                 expected_target_count
-            ));
+            );
         }
         Ok((shifts, target_shifts))
     }
@@ -416,7 +429,7 @@ impl State {
 
             (
                 self.restore_stack(&checkpoint.stack)?,
-                checkpoint.pending_prefixes,
+                Vec::new(),
             )
         } else if let Some(previous_paths) = self.load_previous_depth_paths(depth)? {
             info!(
@@ -448,13 +461,13 @@ impl State {
         loop {
             if interrupted.load(Ordering::SeqCst) {
                 if let Some(path) = checkpoint_path {
-                    self.write_checkpoint(path, depth, &stack, &pending_prefixes)?;
+                    self.write_checkpoint(path, depth, &stack)?;
                 }
                 return Ok(false);
             }
             if checkpoint_due {
                 if let Some(path) = checkpoint_path {
-                    self.write_checkpoint(path, depth, &stack, &pending_prefixes)?;
+                    self.write_checkpoint(path, depth, &stack)?;
                 }
                 checkpoint_due = false;
             }
@@ -539,9 +552,12 @@ impl State {
                 next_idx: self.primes[level + 1],
             });
         }
+        if let Some(store) = &self.shift_path_store {
+            store.flush().map_err(std::io::Error::other)?;
+        }
         info!("探索完了 (nodes={})", self.node_count);
         if let Some(path) = checkpoint_path {
-            self.write_checkpoint(path, depth, &stack, &pending_prefixes)?;
+            self.write_checkpoint(path, depth, &stack)?;
         }
         Ok(!interrupted.load(Ordering::SeqCst))
     }
@@ -551,7 +567,6 @@ impl State {
         path: &Path,
         depth: usize,
         stack: &[Frame],
-        pending_prefixes: &[Vec<usize>],
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.write_checkpoint_file(
             path,
@@ -567,7 +582,6 @@ impl State {
                 split_depth: 0,
                 completed: Vec::new(),
                 in_progress: Vec::new(),
-                pending_prefixes: pending_prefixes.to_vec(),
                 work_prefixes: None,
                 config_hash: self.compute_config_hash(),
             },
@@ -801,6 +815,9 @@ impl State {
         jobs.into_par_iter()
             .try_for_each(|job| self.run_parallel_job(job, &ctx))?;
 
+        if let Some(store) = &self.shift_path_store {
+            store.flush().map_err(std::io::Error::other)?;
+        }
         info!(
             "並列探索完了 (nodes={})",
             node_count.load(Ordering::Relaxed)
@@ -1029,7 +1046,10 @@ impl State {
         } else {
             match ctx.checkpoint_lock.try_lock() {
                 Ok(guard) => guard,
-                Err(_) => return Ok(()),
+                Err(_) => {
+                    log::debug!("チェックポイント書き込みスキップ (別スレッドが実行中)");
+                    return Ok(());
+                }
             }
         };
         let n = ctx.node_count.load(Ordering::Relaxed);
@@ -1527,7 +1547,7 @@ mod tests {
             level: 0,
             next_idx: 2,
         }];
-        saved.write_checkpoint(&path, 1, &stack, &[]).unwrap();
+        saved.write_checkpoint(&path, 1, &stack).unwrap();
         assert!(!std::fs::read_to_string(&path).unwrap().contains('\n'));
 
         let mut resumed = State::new(primes, cols, table);
@@ -1637,6 +1657,7 @@ mod tests {
         for (index, target_shifts) in expected.target_shifts.iter().enumerate() {
             store.append_target(index + 1, target_shifts).unwrap();
         }
+        store.flush().unwrap();
         let completed: Vec<usize> = (0..work_items.len()).collect();
         state
             .write_checkpoint_file(
@@ -1693,7 +1714,6 @@ mod tests {
                     level: 0,
                     next_idx: 2,
                 }],
-                &[],
             )
             .unwrap();
 

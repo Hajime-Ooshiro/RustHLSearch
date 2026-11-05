@@ -543,14 +543,14 @@ impl State {
                     self.results,
                     self.key.len(),
                 );
-                info!(
-                    "探索経過: nodes={} best={} hits={} depth={} key={:?}",
-                    self.node_count,
-                    self.max_score,
-                    self.results,
-                    self.key.len(),
-                    self.key
-                );
+                // info!(
+                //     "探索経過: nodes={} best={} hits={} depth={} key={:?}",
+                //     self.node_count,
+                //     self.max_score,
+                //     self.results,
+                //     self.key.len(),
+                //     self.key
+                // );
                 checkpoint_due = true;
             }
 
@@ -995,14 +995,14 @@ impl State {
                     shared.results,
                     key.len(),
                 );
-                info!(
-                    "探索経過: nodes={} best={} hit={} depth={} key={:?}",
-                    n,
-                    shared.max_score,
-                    shared.results,
-                    key.len(),
-                    key
-                );
+                // info!(
+                //     "探索経過: nodes={} best={} hit={} depth={} key={:?}",
+                //     n,
+                //     shared.max_score,
+                //     shared.results,
+                //    key.len(),
+                //    key
+                //);
                 self.store_parallel_progress(index, &stack, &key, ctx);
                 self.write_parallel_checkpoint(ctx, false, true)?;
             }

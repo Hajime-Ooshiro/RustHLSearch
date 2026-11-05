@@ -1,8 +1,8 @@
 mod bitmask;
 mod output;
 mod primes;
+mod rocksdb_output;
 mod search;
-mod sqlite_output;
 
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -21,6 +21,7 @@ use std::time::Instant;
 
 const CHECKPOINT_FILENAME: &str = "checkpoint.json";
 const CHECKPOINT_BACKUP_FILENAME: &str = "checkpoint.bak";
+const MAX_COLS: usize = 3159;
 
 #[derive(Serialize)]
 struct OutputFile<'a> {
@@ -60,7 +61,7 @@ pub struct Cli {
     )]
     pub mode: SearchMode,
 
-    #[arg(long, default_value_t = 3159, help = "列数 (長さ)")]
+    #[arg(long, default_value_t = MAX_COLS, help = "列数 (長さ、最大 3159)")]
     pub cols: usize,
 
     #[arg(short, long, default_value = ".", help = "出力ディレクトリ")]
@@ -81,6 +82,9 @@ impl Cli {
         }
         if self.cols == 0 {
             return Err("cols must be at least 1".to_string());
+        }
+        if self.cols > MAX_COLS {
+            return Err(format!("cols ({}) cannot exceed {MAX_COLS}", self.cols));
         }
         if self.checkpoint_interval == 0 {
             return Err("checkpoint-interval must be at least 1".to_string());
@@ -136,7 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 探索中にチェックポイントを書き出すため、他の出力より先に output_dir を用意する
     std::fs::create_dir_all(&cli.output_dir)?;
-    let shift_path = cli.output_dir.join("HLSearch.db");
+    let shift_path = cli.output_dir.join("HLSearch.rocksdb");
     let checkpoint_path = cli.output_dir.join(CHECKPOINT_FILENAME);
     let backup_path = cli.output_dir.join(CHECKPOINT_BACKUP_FILENAME);
     let resume_path = if checkpoint_path.exists() {
@@ -197,7 +201,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("該当件数: {}", state.results);
     info!("ターゲット一致件数: {}", state.target_count);
 
-    info!("シフトパスSQLite出力ファイル: {}", shift_path.display());
+    info!(
+        "シフトパスRocksDB出力ディレクトリ: {}",
+        shift_path.display()
+    );
 
     let result_path = with_timestamp(&cli.output_dir.join("result.txt"), cli.depth);
     let result_file = File::create(&result_path)?;
@@ -257,8 +264,18 @@ mod tests {
         cli.cols = 0;
         assert!(cli.validate(3).is_err());
         cli = test_cli();
+        cli.cols = MAX_COLS + 1;
+        assert!(cli.validate(3).is_err());
+        cli = test_cli();
         cli.checkpoint_interval = 0;
         assert!(cli.validate(3).is_err());
+    }
+
+    #[test]
+    fn cli_validation_accepts_maximum_column_count() {
+        let mut cli = test_cli();
+        cli.cols = MAX_COLS;
+        assert!(cli.validate(3).is_ok());
     }
 
     #[test]

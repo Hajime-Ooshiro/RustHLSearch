@@ -54,7 +54,7 @@ src/
   bitmask.rs   # BitMaskによる64-bit単位のビット演算
   primes.rs    # エラトステネスの篩による素数生成
   search.rs    # シフトテーブル生成と逐次・並列DFS
-  sqlite_output.rs # SQLite の親ノード形式シフトパス永続化
+  rocksdb_output.rs # RocksDB の親ノード形式シフトパス永続化
   output.rs    # タイムスタンプ付き出力パス生成
 ```
 
@@ -92,9 +92,9 @@ cargo run --release -- --mode sequential
 cargo run --release -- --mode parallel
 ```
 
-探索中は 100,000 ノードごとに進捗を更新し、DFS の状態と集計値を `--output-dir`（既定は `.`）配下の `checkpoint.json` に自動保存します。実行中に `Ctrl+C` を1回押すと、安全な探索地点で同じチェックポイントを保存して終了します。次回は同じコマンドを実行すると中断地点から再開できます。シフトパスとターゲット一致パスは `HLSearch.db` に保存され、再開時にそこから復元します。更新前の世代は同じディレクトリの `checkpoint.bak` に退避されます。起動時に `checkpoint.json` が存在しない場合は `checkpoint.bak` から復旧を試みます。探索が正常終了すると `checkpoint.json` とバックアップは削除されます。逐次チェックポイントは `--mode sequential` でのみ、並列チェックポイントは `--mode parallel` でのみ再開できます。
+探索中は 100,000 ノードごとに進捗を更新し、DFS の状態と集計値を `--output-dir`（既定は `.`）配下の `checkpoint.json` に自動保存します。実行中に `Ctrl+C` を1回押すと、安全な探索地点で同じチェックポイントを保存して終了します。次回は同じコマンドを実行すると中断地点から再開できます。シフトパスとターゲット一致パスは `HLSearch.rocksdb` に保存され、再開時にそこから復元します。更新前の世代は同じディレクトリの `checkpoint.bak` に退避されます。起動時に `checkpoint.json` が存在しない場合は `checkpoint.bak` から復旧を試みます。探索が正常終了すると `checkpoint.json` とバックアップは削除されます。チェックポイントと RocksDB に保存された結果数が一致しない場合は、保存データを破棄して探索を最初からやり直します。逐次チェックポイントは `--mode sequential` でのみ、並列チェックポイントは `--mode parallel` でのみ再開できます。
 
-探索開始時、同じ `HLSearch.db` の `depth_{depth-1}` テーブル（例: `depth_007`）に行があれば、そのパスを開始パスとして再利用します。前深さのパスが存在しない場合は、通常どおり先頭レベルから探索します。
+探索開始時、同じ `HLSearch.rocksdb` に前深さの保存済みパスがあれば、そのパスを開始パスとして再利用します。前深さのパスが存在しない場合は、通常どおり先頭レベルから探索します。
 
 探索中はスピナーにノード数、最良値、ヒット数、現在深さを表示します。総探索ノード数は探索中に確定しないため、完了率や残り時間は表示しません。表示内容はチェックポイント保存周期ごとに更新され、完了または中断時に最終集計へ切り替わります。ログは `SimpleLogger` により既定で `INFO` レベル以上が出力されます。主要イベントは `INFO`、詳細な探索経過は `DEBUG` として実装されていますが、既定のログレベルでは `DEBUG` ログは表示されません。
 
@@ -109,8 +109,10 @@ cargo run --release -- --checkpoint-interval 50000
 深さ、列数、出力先を指定して実行:
 
 ```bash
-cargo run --release -- --depth 10 --cols 4000 --output-dir results
+cargo run --release -- --depth 10 --cols 3159 --output-dir results
 ```
+
+`--cols` は 1 から 3159 まで指定できます。
 
 > **Note**: 並列モード時のスレッド数は Rayon の既定値（論理コア数）となります。環境変数 `RAYON_NUM_THREADS` でスレッド数を指定可能です。
 > 並列モードではスレッドごとに探索結果を集約します。記録されるパスの順序は実行ごとに異なる場合があります。
@@ -120,7 +122,7 @@ cargo run --release -- --depth 10 --cols 4000 --output-dir results
 実行開始前に次の条件を検証します。条件に違反した場合はエラーを表示して終了します。
 
 - `depth` は 1 以上
-- `cols` は 1 以上
+- `cols` は 1 以上 3159 以下
 - `checkpoint-interval` は 1 以上
 - `depth` は使用する素数数以下
 
@@ -150,13 +152,13 @@ cargo run --release -- --depth 10 --cols 4000 --output-dir results
 | --- | --- | --- | --- |
 | `--depth` | `-d` | `8` | 探索する階層数（使用する素数の個数） |
 | `--mode` | `-m` | `parallel` | 探索モード（`parallel` または `sequential`） |
-| `--cols` | | `3159` | ビット列の長さ |
+| `--cols` | | `3159` | ビット列の長さ（1〜3159） |
 | `--output-dir` | `-o` | `.` | 出力ディレクトリ |
 | `--checkpoint-interval` | | `100000` | チェックポイント保存周期 (ノード数) |
 
 ## 出力ファイル形式
 
-出力ファイルは、シフトパスを `HLSearch.db`、探索結果を `result_depth8_YYYYMMDD_HHMMSS.txt` の形式で出力します。ターゲット値による枝刈りを通過したシフトパスは、探索中に SQLite の親ノード形式で逐次保存されます。深さ `d` の探索で得られたシフトパスは、長さ `k`（1 から `d`）の接頭辞ごとに `depth_{k:03}` テーブル（例: `depth_008`）へ保存されます。各行は `node_id`、`parent_depth`（親が属する深さ。深さ 1 は 0）、`parent_node_id`（`depth_{k-1}` の `node_id`。深さ 1 は NULL）、`shift`、そのパスの `score` を持ちます。同じ深さ内では接頭辞を複数パスで共有します。`depth_{k:03}` の行はすべて長さ `k` のパスのため、完全長かどうかは `is_leaf` ではなく行が属するテーブルで判定します。読み込み時には各行の `parent_node_id` を `depth_{k-1}` 以下へたどってシフト列を復元します。これにより深さ 15 以上の開始パス、チェックポイント再開時の最大葉パスを保存順で読み込めます。`depth_001`〜`depth_249` テーブルは起動時に作成されます。実行開始時の初期化では対象深さの `target_paths` 行だけを削除し、`depth_NNN` の行は保持します。旧 `shift_paths` と `shift_path_leaves` テーブル、および `parent_depth` 列を持たない旧 `depth_NNN` テーブルは初回オープン時に削除されます（旧パスは移行されません）。深さ 249 でターゲット値 447 に一致したパスは、発見ごとに `target_paths` テーブルへ `(depth, target_count, target_shifts)` として追加されます。`target_paths` の主キーは `(depth, target_shifts)` です。
+出力ファイルは、シフトパスを `HLSearch.rocksdb`、探索結果を `result_depth8_YYYYMMDD_HHMMSS.txt` の形式で出力します。ターゲット値による枝刈りを通過したシフトパスは、探索中に RocksDB の親ノード形式で逐次保存されます。`append` ごとに `WriteBatch` をコミットするため、探索完了やチェックポイント作成を待たずにDBへ反映されます。深さ `d` の探索で得られたシフトパスは、長さ `k`（1 から `d`）の接頭辞ごとに `nodes` カラムファミリーへ保存されます。各ノードは `node_id`、`parent_depth`（親が属する深さ。深さ 1 は 0）、`parent_node_id`（親ノード。深さ 1 は NULL）、`shift`、そのパスの `score` を持ちます。同じ深さ内では接頭辞を複数パスで共有します。読み込み時には各行の `parent_node_id` をたどってシフト列を復元します。深さ 249 でターゲット値 447 に一致したパスは、発見ごとに `target_paths` カラムファミリーへ追加されます。
 
 ファイルには実行時設定（`config`）と探索結果（`result`）を含むJSONオブジェクトが出力されます。
 

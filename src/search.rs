@@ -1,5 +1,5 @@
 use crate::bitmask::BitMask;
-use crate::sqlite_output::ShiftPathStore;
+use crate::rocksdb_output::ShiftPathStore;
 use indicatif::{HumanCount, ProgressBar};
 use log::{debug, info};
 use rayon::prelude::*;
@@ -67,6 +67,8 @@ struct Checkpoint {
     #[serde(default)]
     in_progress: Vec<ParallelInProgress>,
     #[serde(default)]
+    pending_prefixes: Vec<usize>,
+    #[serde(default)]
     work_prefixes: Option<ShiftPaths>,
     #[serde(default)]
     config_hash: u64,
@@ -129,26 +131,12 @@ impl ParallelResults {
             return Ok(());
         }
 
-        let is_duplicate = if results.results < 20 {
-            results
-                .shifts
-                .iter()
-                .any(|existing| existing.as_slice() == key)
-        } else {
-            results
-                .shifts
-                .binary_search_by(|existing| {
-                    existing.as_slice().cmp(key)
-                })
-                .is_ok()
-        };
-
-        if !is_duplicate {
+        if let Err(index) = results
+            .shifts
+            .binary_search_by(|existing| existing.as_slice().cmp(key))
+        {
             results.results += 1;
-            results.shifts.push(key.to_vec());
-            if results.results % 100 == 0 {
-                results.shifts.sort();
-            }
+            results.shifts.insert(index, key.to_vec());
         }
         Ok(())
     }
@@ -289,14 +277,13 @@ impl State {
         expected_max_score: usize,
         expected_results: usize,
         expected_target_count: usize,
-    ) -> Result<(ShiftPaths, ShiftPaths), String> {
+    ) -> Result<Option<(ShiftPaths, ShiftPaths)>, String> {
         let Some(store) = &self.shift_path_store else {
             if expected_results == 0 && expected_target_count == 0 {
-                return Ok((Vec::new(), Vec::new()));
+                return Ok(Some((Vec::new(), Vec::new())));
             }
-            return Err(
-                "チェックポイントの結果パスを復元するための SQLite 出力がありません".to_string(),
-            );
+            log::warn!("チェックポイントに記録された結果パスを復元する RocksDB がありません");
+            return Ok(None);
         };
         let shifts = if expected_results == 0 {
             Vec::new()
@@ -304,21 +291,40 @@ impl State {
             store.load_result_paths(expected_max_score)?
         };
         let target_shifts = store.load_target_paths()?;
-        if shifts.len() < expected_results {
+        if shifts.len() != expected_results || target_shifts.len() != expected_target_count {
             log::warn!(
-                "SQLite の結果パス数が期待値より少ないため、DB から読み込める分を使用します (shifts={}/{})",
+                "チェックポイントと RocksDB の結果数が一致しないため、探索を最初からやり直します (shifts={}/{}, targets={}/{})",
                 shifts.len(),
-                expected_results
-            );
-        }
-        if target_shifts.len() < expected_target_count {
-            log::warn!(
-                "SQLite のターゲットパス数が期待値より少ないため、DB から読み込める分を使用します (targets={}/{})",
+                expected_results,
                 target_shifts.len(),
                 expected_target_count
             );
+            store.clear_all_paths()?;
+            return Ok(None);
         }
-        Ok((shifts, target_shifts))
+        Ok(Some((shifts, target_shifts)))
+    }
+
+    fn remove_checkpoint_files(
+        checkpoint_path: Option<&Path>,
+        resume_path: Option<&Path>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut paths = Vec::new();
+        if let Some(path) = checkpoint_path {
+            paths.push(path.to_path_buf());
+            paths.push(path.with_extension("bak"));
+        }
+        if let Some(path) = resume_path {
+            paths.push(path.to_path_buf());
+        }
+        paths.sort();
+        paths.dedup();
+        for path in paths {
+            if path.exists() {
+                fs::remove_file(path)?;
+            }
+        }
+        Ok(())
     }
 
     fn load_previous_depth_paths(
@@ -339,12 +345,12 @@ impl State {
 
     fn aggregate_leaf_result(&mut self, score: usize, key: &[usize]) -> Result<(), String> {
         if score < self.target {
-            info!(
-                "target break (depth={} score={}, key={:?})",
-                self.key.len(),
-                score,
-                key
-            );
+            // info!(
+            //     "target break (depth={} score={}, key={:?})",
+            //     self.key.len(),
+            //     score,
+            //     key
+            // );
             return Ok(());
         }
         if score > self.max_score {
@@ -353,7 +359,16 @@ impl State {
             self.shifts.clear();
             self.shifts.push(key.to_vec());
             info!("best level={} key={:?} score={}", key.len() - 1, key, score);
-        } else if score == self.max_score {
+            return Ok(());
+        }
+        if score == self.max_score {
+            if self
+                .shifts
+                .iter()
+                .any(|existing| existing.as_slice() == key)
+            {
+                return Ok(());
+            }
             self.results += 1;
             self.shifts.push(key.to_vec());
             debug!("best level={} key={:?} score={}", key.len() - 1, key, score);
@@ -402,7 +417,7 @@ impl State {
         resume_path: Option<&Path>,
         interrupted: &AtomicBool,
     ) -> Result<bool, Box<dyn std::error::Error>> {
-        let (mut stack, mut pending_prefixes) = if let Some(path) = resume_path {
+        let resumed = if let Some(path) = resume_path {
             let checkpoint = Self::load_checkpoint(path)?;
             if checkpoint.mode != SearchMode::Sequential {
                 return Err(
@@ -410,27 +425,45 @@ impl State {
                 );
             }
             self.apply_checkpoint_config(&checkpoint, depth)?;
-            self.key = checkpoint.key.clone();
-            self.max_score = checkpoint.max_score;
-            self.results = checkpoint.results;
-            self.target_count = checkpoint.target_count;
-            (self.shifts, self.target_shifts) = self
+            match self
                 .load_checkpoint_paths(
                     checkpoint.max_score,
                     checkpoint.results,
                     checkpoint.target_count,
                 )
-                .map_err(std::io::Error::other)?;
-            self.node_count = checkpoint.node_count;
-            info!(
-                "チェックポイントから探索を再開しました (nodes={})",
-                checkpoint.node_count
-            );
-
-            (
-                self.restore_stack(&checkpoint.stack)?,
-                Vec::new(),
-            )
+                .map_err(std::io::Error::other)?
+            {
+                Some((shifts, target_shifts)) => {
+                    self.key = checkpoint.key.clone();
+                    self.max_score = checkpoint.max_score;
+                    self.results = checkpoint.results;
+                    self.target_count = checkpoint.target_count;
+                    self.shifts = shifts;
+                    self.target_shifts = target_shifts;
+                    self.node_count = checkpoint.node_count;
+                    info!(
+                        "チェックポイントから探索を再開しました (nodes={})",
+                        checkpoint.node_count
+                    );
+                    Some((self.restore_stack(&checkpoint.stack)?, Vec::new()))
+                }
+                None => {
+                    Self::remove_checkpoint_files(checkpoint_path, resume_path)?;
+                    self.key.clear();
+                    self.max_score = 0;
+                    self.results = 0;
+                    self.target_count = 0;
+                    self.shifts.clear();
+                    self.target_shifts.clear();
+                    self.node_count = 0;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let (mut stack, mut pending_prefixes) = if let Some(resumed) = resumed {
+            resumed
         } else if let Some(previous_paths) = self.load_previous_depth_paths(depth)? {
             info!(
                 "depth={} の開始パスとして depth={} の保存済みパス {} 件を使用します",
@@ -511,22 +544,23 @@ impl State {
                     self.key.len(),
                 );
                 info!(
-                    "探索経過: nodes={} best={} hits={} depth={}",
+                    "探索経過: nodes={} best={} hits={} depth={} key={:?}",
                     self.node_count,
                     self.max_score,
                     self.results,
-                    self.key.len()
+                    self.key.len(),
+                    self.key
                 );
                 checkpoint_due = true;
             }
 
             if count < self.target {
-                info!(
-                    "target break (depth={} count={}, key={:?})",
-                    self.key.len(),
-                    count,
-                    self.key
-                );
+                // info!(
+                //     "target break (depth={} count={}, key={:?})",
+                //     self.key.len(),
+                //     count,
+                //     self.key
+                // );
                 self.key.pop();
                 continue;
             }
@@ -582,6 +616,7 @@ impl State {
                 split_depth: 0,
                 completed: Vec::new(),
                 in_progress: Vec::new(),
+                pending_prefixes: Vec::new(),
                 work_prefixes: None,
                 config_hash: self.compute_config_hash(),
             },
@@ -714,6 +749,7 @@ impl State {
 
         let mut split_depth = self.parallel_split_depth(depth);
         let mut checkpoint_work_prefixes = None;
+        let mut checkpoint_resumed = false;
         if let Some(path) = resume_path {
             let checkpoint = Self::load_checkpoint(path)?;
             if checkpoint.mode != SearchMode::Parallel {
@@ -725,46 +761,51 @@ impl State {
             if checkpoint.split_depth > depth {
                 return Err("チェックポイントの split_depth が depth を超えています".into());
             }
-            split_depth = checkpoint.split_depth;
-            checkpoint_work_prefixes = checkpoint.work_prefixes;
-            node_count.store(checkpoint.node_count, Ordering::Relaxed);
-            results
-                .max_score
-                .store(checkpoint.max_score, Ordering::Relaxed);
-            let (shifts, target_shifts) = self
+            let paths = self
                 .load_checkpoint_paths(
                     checkpoint.max_score,
                     checkpoint.results,
                     checkpoint.target_count,
                 )
                 .map_err(std::io::Error::other)?;
-            *results.results.lock().unwrap() = SharedResults {
-                max_score: checkpoint.max_score,
-                results: checkpoint.results,
-                shifts,
-                target_count: checkpoint.target_count,
-                target_shifts,
-                node_count: checkpoint.node_count,
-            };
-            {
-                let mut progress = progress.lock().unwrap();
-                progress.completed = checkpoint.completed.iter().copied().collect();
-                progress.in_progress = checkpoint
-                    .in_progress
-                    .iter()
-                    .cloned()
-                    .map(|item| (item.work_index, item))
-                    .collect();
+            if let Some((shifts, target_shifts)) = paths {
+                split_depth = checkpoint.split_depth;
+                checkpoint_work_prefixes = checkpoint.work_prefixes;
+                checkpoint_resumed = true;
+                node_count.store(checkpoint.node_count, Ordering::Relaxed);
+                results
+                    .max_score
+                    .store(checkpoint.max_score, Ordering::Relaxed);
+                *results.results.lock().unwrap() = SharedResults {
+                    max_score: checkpoint.max_score,
+                    results: checkpoint.results,
+                    shifts,
+                    target_count: checkpoint.target_count,
+                    target_shifts,
+                    node_count: checkpoint.node_count,
+                };
+                {
+                    let mut progress = progress.lock().unwrap();
+                    progress.completed = checkpoint.completed.iter().copied().collect();
+                    progress.in_progress = checkpoint
+                        .in_progress
+                        .iter()
+                        .cloned()
+                        .map(|item| (item.work_index, item))
+                        .collect();
+                }
+                info!(
+                    "チェックポイントから並列探索を再開しました (nodes={})",
+                    checkpoint.node_count
+                );
+            } else {
+                Self::remove_checkpoint_files(checkpoint_path, resume_path)?;
             }
-            info!(
-                "チェックポイントから並列探索を再開しました (nodes={})",
-                checkpoint.node_count
-            );
         }
 
         let work_items = if let Some(work_prefixes) = checkpoint_work_prefixes {
             self.work_items_from_prefixes(depth, work_prefixes)?
-        } else if resume_path.is_some() {
+        } else if checkpoint_resumed {
             self.parallel_work_items(split_depth)?
         } else if let Some(previous_paths) = self.load_previous_depth_paths(depth)? {
             if split_depth != depth - 1 {
@@ -955,8 +996,9 @@ impl State {
                     key.len(),
                 );
                 info!(
-                    "探索経過: nodes={} hit={} depth={} key={:?}",
+                    "探索経過: nodes={} best={} hit={} depth={} key={:?}",
                     n,
+                    shared.max_score,
                     shared.results,
                     key.len(),
                     key
@@ -966,12 +1008,12 @@ impl State {
             }
 
             if c_count < self.target {
-                info!(
-                    "target break (depth={}, count={}, key={:?})",
-                    key.len(),
-                    c_count,
-                    key
-                );
+                // info!(
+                //     "target break (depth={}, count={}, key={:?})",
+                //     key.len(),
+                //     c_count,
+                //     key
+                // );
                 key.pop();
                 continue;
             }
@@ -1179,7 +1221,7 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::{build_shift_table, ParallelResults, State};
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::Mutex;
 
     #[test]
@@ -1208,6 +1250,46 @@ mod tests {
         assert_eq!(snapshot.max_score, 2);
         assert_eq!(snapshot.results, 2);
         assert_eq!(snapshot.shifts, vec![vec![1], vec![2]]);
+    }
+
+    #[test]
+    fn parallel_results_deduplicate_paths_across_twenty_and_one_hundred() {
+        let results = ParallelResults {
+            max_score: AtomicUsize::new(0),
+            results: Mutex::new(Default::default()),
+            target: 0,
+            shift_path_store: None,
+        };
+
+        for value in (0..20).rev() {
+            results.record_path(1, &[value]).unwrap();
+        }
+        for value in 0..20 {
+            results.record_path(1, &[value]).unwrap();
+        }
+        assert_eq!(results.snapshot().results, 20);
+
+        for value in (20..100).rev() {
+            results.record_path(1, &[value]).unwrap();
+        }
+        for value in 0..100 {
+            results.record_path(1, &[value]).unwrap();
+        }
+        assert_eq!(results.snapshot().results, 100);
+
+        for value in (100..120).rev() {
+            results.record_path(1, &[value]).unwrap();
+        }
+        for value in 0..120 {
+            results.record_path(1, &[value]).unwrap();
+        }
+
+        let snapshot = results.snapshot();
+        assert_eq!(snapshot.results, 120);
+        assert_eq!(
+            snapshot.shifts,
+            (0..120).map(|value| vec![value]).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1257,12 +1339,153 @@ mod tests {
     }
 
     #[test]
-    fn sequential_search_writes_each_unpruned_path_to_sqlite() {
+    fn sequential_search_restarts_when_checkpoint_paths_are_incomplete() {
+        let primes = vec![2];
+        let depth = 1;
+        let table = build_shift_table(&primes, 4);
+        let checkpoint_path = unique_checkpoint_path("incomplete-checkpoint");
+        let database_path = checkpoint_path.with_extension("rocksdb");
+        let backup_path = checkpoint_path.with_extension("bak");
+
+        let mut state = State::new(primes, 4, table);
+        state.target = 0;
+        state
+            .set_shift_path_store(&database_path, depth, true)
+            .unwrap();
+        state
+            .shift_path_store
+            .as_ref()
+            .unwrap()
+            .append(2, &[1])
+            .unwrap();
+        state
+            .write_checkpoint_file(
+                &checkpoint_path,
+                &super::Checkpoint {
+                    mode: super::SearchMode::Sequential,
+                    depth,
+                    stack: vec![super::Frame {
+                        level: 0,
+                        next_idx: 0,
+                    }],
+                    key: Vec::new(),
+                    max_score: 2,
+                    results: 2,
+                    target_count: 0,
+                    node_count: 1,
+                    split_depth: 0,
+                    completed: Vec::new(),
+                    in_progress: Vec::new(),
+                    pending_prefixes: Vec::new(),
+                    work_prefixes: None,
+                    config_hash: state.compute_config_hash(),
+                },
+            )
+            .unwrap();
+        std::fs::write(&backup_path, b"stale checkpoint").unwrap();
+
+        state
+            .search_with_checkpoint(depth, Some(&checkpoint_path), Some(&checkpoint_path))
+            .unwrap();
+
+        assert_eq!(state.node_count, 2);
+        assert_eq!(state.max_score, 2);
+        assert_eq!(state.results, 2);
+        assert_eq!(
+            state
+                .shift_path_store
+                .as_ref()
+                .unwrap()
+                .load_result_paths(2)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(!backup_path.exists());
+
+        drop(state);
+        let _ = std::fs::remove_file(checkpoint_path);
+        let _ = std::fs::remove_dir_all(database_path);
+    }
+
+    #[test]
+    fn parallel_search_restarts_when_checkpoint_paths_are_incomplete() {
+        let primes = vec![2];
+        let depth = 1;
+        let table = build_shift_table(&primes, 4);
+        let checkpoint_path = unique_checkpoint_path("parallel-incomplete-checkpoint");
+        let database_path = checkpoint_path.with_extension("rocksdb");
+        let mut state = State::new(primes, 4, table);
+        state.target = 0;
+        state
+            .set_shift_path_store(&database_path, depth, true)
+            .unwrap();
+        state
+            .shift_path_store
+            .as_ref()
+            .unwrap()
+            .append(2, &[1])
+            .unwrap();
+        state
+            .write_checkpoint_file(
+                &checkpoint_path,
+                &super::Checkpoint {
+                    mode: super::SearchMode::Parallel,
+                    depth,
+                    stack: Vec::new(),
+                    key: Vec::new(),
+                    max_score: 2,
+                    results: 2,
+                    target_count: 0,
+                    node_count: 1,
+                    split_depth: 1,
+                    completed: Vec::new(),
+                    in_progress: Vec::new(),
+                    pending_prefixes: Vec::new(),
+                    work_prefixes: None,
+                    config_hash: state.compute_config_hash(),
+                },
+            )
+            .unwrap();
+
+        let interrupted = AtomicBool::new(false);
+        let (result, completed) = state
+            .search_parallel_interruptible(
+                depth,
+                Some(&checkpoint_path),
+                Some(&checkpoint_path),
+                &interrupted,
+            )
+            .unwrap();
+
+        assert!(completed);
+        assert_ne!(result.node_count, 1);
+        assert_eq!(result.max_score, 2);
+        assert_eq!(result.results, 2);
+        assert_eq!(
+            state
+                .shift_path_store
+                .as_ref()
+                .unwrap()
+                .load_result_paths(2)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        drop(state);
+        let _ = std::fs::remove_file(&checkpoint_path);
+        let _ = std::fs::remove_file(checkpoint_path.with_extension("bak"));
+        let _ = std::fs::remove_dir_all(&database_path);
+    }
+
+    #[test]
+    fn sequential_search_writes_each_unpruned_path_to_rocksdb() {
         let primes = vec![2, 3];
         let cols = 4;
         let table = build_shift_table(&primes, cols);
         let path = std::env::temp_dir().join(format!(
-            "hlsearch-shift-paths-{}-{}.sqlite",
+            "hlsearch-shift-paths-{}-{}.rocksdb",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1275,24 +1498,16 @@ mod tests {
 
         state.search_with_checkpoint(2, None, None).unwrap();
 
-        let connection = rusqlite::Connection::open(&path).unwrap();
-        let roots: usize = connection
-            .query_row("SELECT COUNT(*) FROM depth_001", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(roots, 2);
-        let nodes: Vec<(Option<i64>, usize)> = connection
-            .prepare("SELECT parent_node_id, shift FROM depth_002 ORDER BY node_id")
-            .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
+        let store = state.shift_path_store.as_ref().unwrap();
+        assert_eq!(store.load_nodes(1).unwrap().len(), 2);
+        let nodes = store.load_nodes(2).unwrap();
         assert_eq!(nodes.len(), 6);
-        assert!(nodes.iter().all(|(parent, _)| parent.is_some()));
+        assert!(nodes
+            .iter()
+            .all(|(_, record)| record.parent_node_id.is_some()));
 
-        drop(connection);
         drop(state);
-        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
@@ -1301,7 +1516,8 @@ mod tests {
         let primes = vec![2; depth];
         let cols = 4;
         let table = build_shift_table(&primes, cols);
-        let database_path = unique_checkpoint_path("previous-depth-paths").with_extension("db");
+        let database_path =
+            unique_checkpoint_path("previous-depth-paths").with_extension("rocksdb");
         let prefix = vec![0; depth - 1];
 
         let mut previous = State::new(primes.clone(), cols, table.clone());
@@ -1361,7 +1577,7 @@ mod tests {
         let _ = std::fs::remove_file(checkpoint_path);
         let _ = std::fs::remove_file(backup_path);
         drop(resumed);
-        std::fs::remove_file(database_path).unwrap();
+        std::fs::remove_dir_all(database_path).unwrap();
     }
 
     #[test]
@@ -1601,7 +1817,7 @@ mod tests {
         let depth = 3;
         let table = build_shift_table(&primes, cols);
         let path = unique_checkpoint_path("parallel-checkpoint");
-        let database_path = path.with_extension("db");
+        let database_path = path.with_extension("rocksdb");
 
         let mut state = State::new(primes.clone(), cols, table.clone());
         state.checkpoint_interval = 1;
@@ -1609,6 +1825,7 @@ mod tests {
             .set_shift_path_store(&database_path, depth, true)
             .unwrap();
         let expected = state.search_parallel(depth, Some(&path), None).unwrap();
+        drop(state); // RocksDB はディレクトリロックを持つため、再オープン前に閉じる
 
         let mut resumed = State::new(primes, cols, table);
         resumed
@@ -1626,7 +1843,7 @@ mod tests {
         let backup_path = path.with_extension("bak");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(backup_path);
-        let _ = std::fs::remove_file(database_path);
+        let _ = std::fs::remove_dir_all(database_path);
     }
 
     #[test]
@@ -1646,7 +1863,7 @@ mod tests {
         let expected = expected_state.search_parallel(depth, None, None).unwrap();
 
         let path = unique_checkpoint_path("parallel-completed");
-        let database_path = path.with_extension("db");
+        let database_path = path.with_extension("rocksdb");
         state
             .set_shift_path_store(&database_path, depth, true)
             .unwrap();
@@ -1680,6 +1897,7 @@ mod tests {
                 },
             )
             .unwrap();
+        drop(state); // RocksDB のロック解放
 
         let mut resumed = State::new(primes, cols, table);
         resumed.target = 0;
@@ -1696,7 +1914,7 @@ mod tests {
         let backup_path = path.with_extension("bak");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(backup_path);
-        let _ = std::fs::remove_file(database_path);
+        let _ = std::fs::remove_dir_all(database_path);
     }
 
     #[test]

@@ -338,7 +338,7 @@ impl State {
             return Ok(None);
         };
         let paths = store
-            .load_full_depth_paths(depth - 1)
+            .load_viable_depth_paths(depth - 1, self.target)
             .map_err(std::io::Error::other)?;
         Ok((!paths.is_empty()).then_some(paths))
     }
@@ -1508,6 +1508,47 @@ mod tests {
 
         drop(state);
         std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn previous_depth_paths_only_keep_prefixes_that_can_still_hit_the_target() {
+        let depth = 2;
+        let primes = vec![2; depth];
+        let cols = 4;
+        let table = build_shift_table(&primes, cols);
+        let database_path =
+            unique_checkpoint_path("previous-depth-target-filter").with_extension("rocksdb");
+
+        let mut previous = State::new(primes.clone(), cols, table.clone());
+        previous.target = 2;
+        previous
+            .set_shift_path_store(&database_path, depth - 1, true)
+            .unwrap();
+        previous
+            .shift_path_store
+            .as_ref()
+            .unwrap()
+            .append(1, &[0])
+            .unwrap();
+        previous
+            .shift_path_store
+            .as_ref()
+            .unwrap()
+            .append(2, &[1])
+            .unwrap();
+        drop(previous);
+
+        let previous_paths = {
+            let mut state = State::new(primes, cols, table);
+            state.target = 2;
+            state
+                .set_shift_path_store(&database_path, depth, false)
+                .unwrap();
+            state.load_previous_depth_paths(depth).unwrap().unwrap()
+        };
+
+        assert_eq!(previous_paths, vec![vec![1]]);
+        std::fs::remove_dir_all(database_path).unwrap();
     }
 
     #[test]

@@ -245,16 +245,25 @@ impl ShiftPathStore {
     }
 
     pub fn load_result_paths(&self, max_count: usize) -> Result<Vec<Vec<usize>>, String> {
-        self.load_leaf_paths(self.depth, Some(max_count))
+        self.load_leaf_paths(self.depth, None, Some(max_count))
     }
 
     pub fn load_full_depth_paths(&self, depth: usize) -> Result<Vec<Vec<usize>>, String> {
-        self.load_leaf_paths(depth, None)
+        self.load_leaf_paths(depth, None, None)
+    }
+
+    pub fn load_viable_depth_paths(
+        &self,
+        depth: usize,
+        min_score: usize,
+    ) -> Result<Vec<Vec<usize>>, String> {
+        self.load_leaf_paths(depth, Some(min_score), None)
     }
 
     fn load_leaf_paths(
         &self,
         depth: usize,
+        min_score: Option<usize>,
         max_count: Option<usize>,
     ) -> Result<Vec<Vec<usize>>, String> {
         self.flush()?;
@@ -265,7 +274,10 @@ impl ShiftPathStore {
             .load_nodes(depth)?
             .into_iter()
             .map(|(_, record)| record)
-            .filter(|record| max_count.is_none_or(|score| record.score == score))
+            .filter(|record| {
+                min_score.map(|score| record.score >= score).unwrap_or(true)
+                    && max_count.map(|score| record.score == score).unwrap_or(true)
+            })
             .collect();
 
         let mut paths: Vec<Vec<usize>> = leaves.iter().map(|leaf| vec![leaf.shift]).collect();

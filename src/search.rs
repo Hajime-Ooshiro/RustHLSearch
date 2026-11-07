@@ -62,13 +62,15 @@ struct Checkpoint {
     node_count: u64,
     #[serde(default)]
     split_depth: usize,
-    #[serde(default)]
+    // ワーク一覧をチェックポイントに展開すると深い探索で巨大化するため、常に再構築する。
+    #[serde(skip_serializing, skip_deserializing, default)]
     completed: Vec<usize>,
-    #[serde(default)]
+    #[serde(skip_serializing, skip_deserializing, default)]
     in_progress: Vec<ParallelInProgress>,
-    #[serde(default)]
+    #[allow(dead_code)]
+    #[serde(skip_serializing, skip_deserializing, default)]
     pending_prefixes: Vec<usize>,
-    #[serde(default)]
+    #[serde(skip_serializing, skip_deserializing, default)]
     work_prefixes: Option<ShiftPaths>,
     #[serde(default)]
     config_hash: u64,
@@ -103,6 +105,13 @@ impl ParallelResults {
     fn record_target(&self, depth: usize, score: usize, key: &[usize]) -> Result<(), String> {
         if depth == 249 && score == self.target {
             let mut results = self.results.lock().unwrap();
+            if results
+                .target_shifts
+                .iter()
+                .any(|existing| existing.as_slice() == key)
+            {
+                return Ok(());
+            }
             let target_count = results.target_count + 1;
             if let Some(store) = &self.shift_path_store {
                 store.append_target(target_count, key)?;
@@ -162,7 +171,6 @@ struct ParallelProgress {
 struct ParallelSearchCtx<'a> {
     depth: usize,
     split_depth: usize,
-    work_prefixes: &'a ShiftPaths,
     results: &'a ParallelResults,
     node_count: &'a AtomicU64,
     progress: &'a Mutex<ParallelProgress>,
@@ -383,6 +391,13 @@ impl State {
         key: &[usize],
     ) -> Result<(), String> {
         if depth == 249 && score == self.target {
+            if self
+                .target_shifts
+                .iter()
+                .any(|existing| existing.as_slice() == key)
+            {
+                return Ok(());
+            }
             let target_count = self.target_count + 1;
             if let Some(store) = &self.shift_path_store {
                 store.append_target(target_count, key)?;
@@ -822,10 +837,6 @@ impl State {
         } else {
             self.parallel_work_items(split_depth)?
         };
-        let work_prefixes = work_items
-            .iter()
-            .map(|work_item| work_item.key.clone())
-            .collect();
         let jobs = {
             let progress = progress.lock().unwrap();
             self.parallel_jobs(&work_items, &progress)?
@@ -834,7 +845,6 @@ impl State {
         let ctx = ParallelSearchCtx {
             depth,
             split_depth,
-            work_prefixes: &work_prefixes,
             results: results.as_ref(),
             node_count: node_count.as_ref(),
             progress: &progress,
@@ -1100,14 +1110,6 @@ impl State {
             return Ok(());
         }
 
-        let (completed, in_progress) = {
-            let progress = ctx.progress.lock().unwrap();
-            let mut completed: Vec<_> = progress.completed.iter().copied().collect();
-            completed.sort_unstable();
-            let mut in_progress: Vec<_> = progress.in_progress.values().cloned().collect();
-            in_progress.sort_by_key(|item| item.work_index);
-            (completed, in_progress)
-        };
         let shared = ctx.results.snapshot();
         self.write_checkpoint_file(
             path,
@@ -1121,10 +1123,10 @@ impl State {
                 target_count: shared.target_count,
                 node_count: n,
                 split_depth: ctx.split_depth,
-                completed,
-                in_progress,
+                completed: Vec::new(),
+                in_progress: Vec::new(),
                 pending_prefixes: Vec::new(),
-                work_prefixes: Some(ctx.work_prefixes.clone()),
+                work_prefixes: None,
                 config_hash: self.compute_config_hash(),
             },
         )
@@ -1608,11 +1610,10 @@ mod tests {
         let resumed_result = resumed
             .search_parallel(depth, Some(&checkpoint_path), Some(&checkpoint_path))
             .unwrap();
-        assert_eq!(resumed_result.shifts, result.shifts);
-        assert!(resumed_result
-            .shifts
-            .iter()
-            .all(|path| path[..depth - 1] == prefix));
+        let mut expected = State::new(vec![2; depth], cols, build_shift_table(&[2; 2], cols));
+        expected.target = 0;
+        let expected_result = expected.search_parallel(depth, None, None).unwrap();
+        assert_eq!(resumed_result.shifts, expected_result.shifts);
 
         let backup_path = checkpoint_path.with_extension("bak");
         let _ = std::fs::remove_file(checkpoint_path);
@@ -1888,7 +1889,7 @@ mod tests {
     }
 
     #[test]
-    fn parallel_resume_skips_completed_work_items() {
+    fn parallel_checkpoint_omits_work_lists_and_restarts_work_items() {
         let primes = vec![2, 3, 5];
         let cols = 8;
         let depth = 3;
@@ -1938,6 +1939,10 @@ mod tests {
                 },
             )
             .unwrap();
+        let checkpoint = std::fs::read_to_string(&path).unwrap();
+        assert!(!checkpoint.contains("\"completed\""));
+        assert!(!checkpoint.contains("\"in_progress\""));
+        assert!(!checkpoint.contains("\"work_prefixes\""));
         drop(state); // RocksDB のロック解放
 
         let mut resumed = State::new(primes, cols, table);
@@ -1956,6 +1961,32 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(backup_path);
         let _ = std::fs::remove_dir_all(database_path);
+    }
+
+    #[test]
+    fn checkpoint_ignores_legacy_work_lists() {
+        let checkpoint: super::Checkpoint = serde_json::from_str(
+            r#"{
+                "mode":"parallel",
+                "depth":3,
+                "stack":[],
+                "key":[],
+                "max_score":0,
+                "results":0,
+                "node_count":0,
+                "split_depth":2,
+                "completed":[0,1,2],
+                "in_progress":[{"work_index":3,"stack":[],"key":[0,1]}],
+                "pending_prefixes":[0,1],
+                "work_prefixes":[[0,1],[1,2]]
+            }"#,
+        )
+        .unwrap();
+
+        assert!(checkpoint.completed.is_empty());
+        assert!(checkpoint.in_progress.is_empty());
+        assert!(checkpoint.pending_prefixes.is_empty());
+        assert!(checkpoint.work_prefixes.is_none());
     }
 
     #[test]

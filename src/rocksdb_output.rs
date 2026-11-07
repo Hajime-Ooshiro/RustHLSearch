@@ -248,9 +248,11 @@ impl ShiftPathStore {
         self.load_leaf_paths(self.depth, None, Some(max_count))
     }
 
+    /*
     pub fn load_full_depth_paths(&self, depth: usize) -> Result<Vec<Vec<usize>>, String> {
         self.load_leaf_paths(depth, None, None)
     }
+    */
 
     pub fn load_viable_depth_paths(
         &self,
@@ -460,7 +462,7 @@ mod tests {
         store.append(11, &[1, 3]).unwrap();
 
         assert_eq!(
-            store.load_full_depth_paths(2).unwrap(),
+            store.load_leaf_paths(2, None, None).unwrap(),
             vec![vec![1, 2], vec![1, 3]]
         );
         assert_eq!(store.load_result_paths(11).unwrap(), vec![vec![1, 3]]);
@@ -492,9 +494,15 @@ mod tests {
         let store = ShiftPathStore::create(&path, 3, true, 12345).unwrap();
         store.append(4, &[1, 2, 3]).unwrap();
 
-        assert_eq!(store.load_full_depth_paths(1).unwrap(), vec![vec![1]]);
-        assert_eq!(store.load_full_depth_paths(2).unwrap(), vec![vec![1, 2]]);
-        assert_eq!(store.load_full_depth_paths(3).unwrap(), vec![vec![1, 2, 3]]);
+        assert_eq!(store.load_leaf_paths(1, None, None).unwrap(), vec![vec![1]]);
+        assert_eq!(
+            store.load_leaf_paths(2, None, None).unwrap(),
+            vec![vec![1, 2]]
+        );
+        assert_eq!(
+            store.load_leaf_paths(3, None, None).unwrap(),
+            vec![vec![1, 2, 3]]
+        );
         assert_eq!(store.load_result_paths(4).unwrap(), vec![vec![1, 2, 3]]);
 
         drop(store);
@@ -529,7 +537,10 @@ mod tests {
         drop(store);
 
         let store = ShiftPathStore::create(&path, 2, true, 12345).unwrap();
-        assert_eq!(store.load_full_depth_paths(2).unwrap(), vec![vec![1, 2]]);
+        assert_eq!(
+            store.load_leaf_paths(2, None, None).unwrap(),
+            vec![vec![1, 2]]
+        );
         assert!(store.load_target_paths().unwrap().is_empty());
 
         drop(store);
@@ -566,7 +577,7 @@ mod tests {
         store.append(6, &[1, 3]).unwrap();
         store.append(5, &[1, 2]).unwrap();
         assert_eq!(
-            store.load_full_depth_paths(2).unwrap(),
+            store.load_leaf_paths(2, None, None).unwrap(),
             vec![vec![1, 2], vec![1, 3]]
         );
         assert_eq!(store.load_nodes(1).unwrap().len(), 1);

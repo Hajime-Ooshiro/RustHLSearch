@@ -19,8 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-const CHECKPOINT_FILENAME: &str = "checkpoint.json";
-const CHECKPOINT_BACKUP_FILENAME: &str = "checkpoint.bak";
+const CHECKPOINT_FILENAME: &str = "checkpoint.sqlite";
 const MAX_COLS: usize = 3159;
 
 #[derive(Serialize)]
@@ -142,12 +141,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&cli.output_dir)?;
     let shift_path = cli.output_dir.join("HLSearch.rocksdb");
     let checkpoint_path = cli.output_dir.join(CHECKPOINT_FILENAME);
-    let backup_path = cli.output_dir.join(CHECKPOINT_BACKUP_FILENAME);
-    let resume_path = if checkpoint_path.exists() {
-        Some(checkpoint_path.as_path())
-    } else {
-        backup_path.exists().then_some(backup_path.as_path())
-    };
+    let legacy_checkpoint_path = cli.output_dir.join("checkpoint.json");
+    let legacy_backup_path = cli.output_dir.join("checkpoint.bak");
+    if !checkpoint_path.exists() {
+        let legacy_path = if legacy_checkpoint_path.exists() {
+            Some(legacy_checkpoint_path.as_path())
+        } else if legacy_backup_path.exists() {
+            Some(legacy_backup_path.as_path())
+        } else {
+            None
+        };
+        if let Some(legacy_path) = legacy_path {
+            state.migrate_legacy_checkpoint(legacy_path, &checkpoint_path)?;
+            if legacy_checkpoint_path.exists() {
+                std::fs::remove_file(&legacy_checkpoint_path)?;
+            }
+            if legacy_backup_path.exists() {
+                std::fs::remove_file(&legacy_backup_path)?;
+            }
+            info!("旧形式のチェックポイントを SQLite に移行しました");
+        }
+    }
+    let resume_path = checkpoint_path
+        .exists()
+        .then_some(checkpoint_path.as_path());
     state.set_shift_path_store(&shift_path, cli.depth, resume_path.is_none())?;
 
     let completed = match cli.mode {
@@ -185,9 +202,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if checkpoint_path.exists() {
         std::fs::remove_file(&checkpoint_path)?;
-        if backup_path.exists() {
-            std::fs::remove_file(&backup_path)?;
-        }
         info!(
             "探索完了のためチェックポイントを削除: {}",
             checkpoint_path.display()

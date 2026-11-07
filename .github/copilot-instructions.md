@@ -5,8 +5,8 @@
 RustHLSearch is a Rust 2021 command-line program for searching prime-shift
 sequences. The implementation is split across `src/main.rs`, `src/search.rs`,
 `src/bitmask.rs`, `src/primes.rs`, `src/output.rs`, and
-`src/rocksdb_output.rs`. It uses RocksDB for shift-path persistence; SQLite is
-not part of the application.
+`src/rocksdb_output.rs`. It uses SQLite for checkpoint persistence and RocksDB
+for shift-path persistence.
 
 ## Build, test, and lint
 
@@ -32,7 +32,8 @@ after Rust changes and run the narrowest relevant tests before broader checks.
 - `bitmask.rs` implements logical-size-aware bit masks and in-place AND plus
   popcount.
 - `search.rs` contains shift-table construction, iterative sequential and
-  Rayon-parallel DFS, result aggregation, and checkpoint/resume handling.
+  Rayon-parallel DFS, result aggregation, and SQLite-backed checkpoint/resume
+  handling.
 - `rocksdb_output.rs` stores reusable shift-path prefixes and target paths in
   `HLSearch.rocksdb`.
 - `output.rs` builds timestamped result paths.

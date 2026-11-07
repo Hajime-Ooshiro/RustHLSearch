@@ -3,6 +3,7 @@ use crate::rocksdb_output::ShiftPathStore;
 use indicatif::{HumanCount, ProgressBar};
 use log::{debug, info};
 use rayon::prelude::*;
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -320,7 +321,6 @@ impl State {
         let mut paths = Vec::new();
         if let Some(path) = checkpoint_path {
             paths.push(path.to_path_buf());
-            paths.push(path.with_extension("bak"));
         }
         if let Some(path) = resume_path {
             paths.push(path.to_path_buf());
@@ -648,22 +648,41 @@ impl State {
                 fs::create_dir_all(parent)?;
             }
         }
-        let temporary_path = path.with_extension("tmp");
-        let file = fs::File::create(&temporary_path)?;
-        serde_json::to_writer(file, checkpoint)?;
-        if path.exists() {
-            let backup_path = path.with_extension("bak");
-            if backup_path.exists() {
-                fs::remove_file(&backup_path)?;
-            }
-            fs::rename(path, backup_path)?;
-        }
-        fs::rename(temporary_path, path)?;
+        let payload = serde_json::to_string(checkpoint)?;
+        let mut connection = Connection::open(path)?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "CREATE TABLE IF NOT EXISTS checkpoint (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                payload TEXT NOT NULL
+            )",
+            [],
+        )?;
+        transaction.execute(
+            "INSERT INTO checkpoint (id, payload) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET payload = excluded.payload",
+            params![payload],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
+    pub fn migrate_legacy_checkpoint(
+        &self,
+        legacy_path: &Path,
+        sqlite_path: &Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let checkpoint: Checkpoint = serde_json::from_reader(fs::File::open(legacy_path)?)?;
+        self.write_checkpoint_file(sqlite_path, &checkpoint)
+    }
+
     fn load_checkpoint(path: &Path) -> Result<Checkpoint, Box<dyn std::error::Error>> {
-        Ok(serde_json::from_reader(std::fs::File::open(path)?)?)
+        let connection = Connection::open(path)?;
+        let payload: String =
+            connection.query_row("SELECT payload FROM checkpoint WHERE id = 1", [], |row| {
+                row.get(0)
+            })?;
+        Ok(serde_json::from_str(&payload)?)
     }
 
     fn apply_checkpoint_config(
@@ -1223,6 +1242,7 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::{build_shift_table, ParallelResults, State};
+    use rusqlite::Connection;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::Mutex;
 
@@ -1347,7 +1367,6 @@ mod tests {
         let table = build_shift_table(&primes, 4);
         let checkpoint_path = unique_checkpoint_path("incomplete-checkpoint");
         let database_path = checkpoint_path.with_extension("rocksdb");
-        let backup_path = checkpoint_path.with_extension("bak");
 
         let mut state = State::new(primes, 4, table);
         state.target = 0;
@@ -1384,7 +1403,6 @@ mod tests {
                 },
             )
             .unwrap();
-        std::fs::write(&backup_path, b"stale checkpoint").unwrap();
 
         state
             .search_with_checkpoint(depth, Some(&checkpoint_path), Some(&checkpoint_path))
@@ -1403,7 +1421,6 @@ mod tests {
                 .len(),
             2
         );
-        assert!(!backup_path.exists());
 
         drop(state);
         let _ = std::fs::remove_file(checkpoint_path);
@@ -1477,7 +1494,6 @@ mod tests {
 
         drop(state);
         let _ = std::fs::remove_file(&checkpoint_path);
-        let _ = std::fs::remove_file(checkpoint_path.with_extension("bak"));
         let _ = std::fs::remove_dir_all(&database_path);
     }
 
@@ -1615,9 +1631,7 @@ mod tests {
         let expected_result = expected.search_parallel(depth, None, None).unwrap();
         assert_eq!(resumed_result.shifts, expected_result.shifts);
 
-        let backup_path = checkpoint_path.with_extension("bak");
         let _ = std::fs::remove_file(checkpoint_path);
-        let _ = std::fs::remove_file(backup_path);
         drop(resumed);
         std::fs::remove_dir_all(database_path).unwrap();
     }
@@ -1686,9 +1700,7 @@ mod tests {
         assert!(!completed);
         assert!(path.exists());
 
-        let backup_path = path.with_extension("bak");
         let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(backup_path);
     }
 
     #[test]
@@ -1708,9 +1720,7 @@ mod tests {
         assert!(!completed);
         assert!(path.exists());
 
-        let backup_path = path.with_extension("bak");
         let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(backup_path);
     }
 
     #[test]
@@ -1792,7 +1802,7 @@ mod tests {
         let cols = 4;
         let table = build_shift_table(&primes, cols);
         let path = std::env::temp_dir().join(format!(
-            "hlsearch-checkpoint-{}-{}.json",
+            "hlsearch-checkpoint-{}-{}.sqlite",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1806,17 +1816,63 @@ mod tests {
             next_idx: 2,
         }];
         saved.write_checkpoint(&path, 1, &stack).unwrap();
-        assert!(!std::fs::read_to_string(&path).unwrap().contains('\n'));
+        let payload: String = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT payload FROM checkpoint WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(!payload.contains('\n'));
+        let loaded = State::load_checkpoint(&path).unwrap();
+        assert_eq!(loaded.depth, 1);
+        assert_eq!(loaded.stack[0].next_idx, 2);
 
         let mut resumed = State::new(primes, cols, table);
         resumed
             .search_with_checkpoint(1, Some(&path), Some(&path))
             .unwrap();
 
-        let backup_path = path.with_extension("bak");
-        assert!(backup_path.exists());
         std::fs::remove_file(&path).unwrap();
-        std::fs::remove_file(backup_path).unwrap();
+    }
+
+    #[test]
+    fn legacy_json_checkpoint_migrates_to_sqlite() {
+        let primes = vec![2];
+        let cols = 4;
+        let state = State::new(primes, cols, build_shift_table(&[2], cols));
+        let json_path = unique_checkpoint_path("legacy-checkpoint").with_extension("json");
+        let sqlite_path = unique_checkpoint_path("migrated-checkpoint");
+        let checkpoint = super::Checkpoint {
+            mode: super::SearchMode::Sequential,
+            depth: 1,
+            stack: vec![super::Frame {
+                level: 0,
+                next_idx: 1,
+            }],
+            key: vec![1],
+            max_score: 2,
+            results: 1,
+            target_count: 0,
+            node_count: 17,
+            split_depth: 0,
+            completed: Vec::new(),
+            in_progress: Vec::new(),
+            pending_prefixes: Vec::new(),
+            work_prefixes: None,
+            config_hash: state.compute_config_hash(),
+        };
+        serde_json::to_writer(std::fs::File::create(&json_path).unwrap(), &checkpoint).unwrap();
+
+        state
+            .migrate_legacy_checkpoint(&json_path, &sqlite_path)
+            .unwrap();
+        let migrated = State::load_checkpoint(&sqlite_path).unwrap();
+        assert_eq!(migrated.depth, 1);
+        assert_eq!(migrated.key, vec![1]);
+        assert_eq!(migrated.node_count, 17);
+
+        std::fs::remove_file(json_path).unwrap();
+        std::fs::remove_file(sqlite_path).unwrap();
     }
 
     #[test]
@@ -1843,7 +1899,7 @@ mod tests {
 
     fn unique_checkpoint_path(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
-            "hlsearch-{label}-{}-{}.json",
+            "hlsearch-{label}-{}-{}.sqlite",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1882,9 +1938,7 @@ mod tests {
         assert_eq!(result.shifts.len(), expected.results);
         assert_eq!(result.node_count, expected.node_count);
 
-        let backup_path = path.with_extension("bak");
         let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(backup_path);
         let _ = std::fs::remove_dir_all(database_path);
     }
 
@@ -1939,7 +1993,12 @@ mod tests {
                 },
             )
             .unwrap();
-        let checkpoint = std::fs::read_to_string(&path).unwrap();
+        let checkpoint: String = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT payload FROM checkpoint WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
         assert!(!checkpoint.contains("\"completed\""));
         assert!(!checkpoint.contains("\"in_progress\""));
         assert!(!checkpoint.contains("\"work_prefixes\""));
@@ -1957,9 +2016,7 @@ mod tests {
         assert_eq!(result.results, expected.results);
         assert_eq!(result.shifts, expected.shifts);
 
-        let backup_path = path.with_extension("bak");
         let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(backup_path);
         let _ = std::fs::remove_dir_all(database_path);
     }
 
@@ -2014,9 +2071,7 @@ mod tests {
             .to_string();
         assert!(err.contains("sequential"));
 
-        let backup_path = path.with_extension("bak");
         let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(backup_path);
     }
 
     #[test]

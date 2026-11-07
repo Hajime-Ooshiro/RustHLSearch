@@ -131,7 +131,7 @@ impl ShiftPathStore {
                 .map_err(|_| "バッファのロック取得に失敗しました".to_string())?;
             buffer.push((max_count, path.to_vec()));
         }
-        self.flush()
+        Ok(())
     }
 
     pub fn flush(&self) -> Result<(), String> {
@@ -233,6 +233,10 @@ impl ShiftPathStore {
     }
 
     pub fn clear_all_paths(&self) -> Result<(), String> {
+        self.pending_appends
+            .lock()
+            .map_err(|_| "バッファのロック取得に失敗しました".to_string())?
+            .clear();
         for name in [CF_NODES, CF_INDEX, CF_TARGETS] {
             clear_column_family(&self.db, cf(&self.db, name)?)?;
         }
@@ -510,14 +514,23 @@ mod tests {
     }
 
     #[test]
-    fn append_commits_paths_without_waiting_for_a_later_flush() {
+    fn append_buffers_paths_until_flush() {
         let path = database_path();
         let store = ShiftPathStore::create(&path, 1, true, 12345).unwrap();
 
         store.append(4, &[1]).unwrap();
 
-        assert!(store.pending_appends.lock().unwrap().is_empty());
+        assert_eq!(store.pending_appends.lock().unwrap().len(), 1);
         let nodes_cf = super::cf(&store.db, super::CF_NODES).unwrap();
+        assert!(store
+            .db
+            .get_cf(nodes_cf, super::make_node_id(1, 1).to_be_bytes())
+            .unwrap()
+            .is_none());
+
+        store.flush().unwrap();
+
+        assert!(store.pending_appends.lock().unwrap().is_empty());
         assert!(store
             .db
             .get_cf(nodes_cf, super::make_node_id(1, 1).to_be_bytes())

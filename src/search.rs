@@ -63,16 +63,15 @@ struct Checkpoint {
     node_count: u64,
     #[serde(default)]
     split_depth: usize,
-    // ワーク一覧をチェックポイントに展開すると深い探索で巨大化するため、常に再構築する。
-    #[serde(skip_serializing, skip_deserializing, default)]
+    #[serde(default)]
     completed: Vec<usize>,
-    #[serde(skip_serializing, skip_deserializing, default)]
+    #[serde(default)]
     in_progress: Vec<ParallelInProgress>,
     #[allow(dead_code)]
     #[serde(skip_serializing, skip_deserializing, default)]
     pending_prefixes: Vec<usize>,
-    #[serde(skip_serializing, skip_deserializing, default)]
-    work_prefixes: Option<ShiftPaths>,
+    #[serde(default)]
+    use_previous_depth_paths: bool,
     #[serde(default)]
     config_hash: u64,
 }
@@ -172,6 +171,7 @@ struct ParallelProgress {
 struct ParallelSearchCtx<'a> {
     depth: usize,
     split_depth: usize,
+    use_previous_depth_paths: bool,
     results: &'a ParallelResults,
     node_count: &'a AtomicU64,
     progress: &'a Mutex<ParallelProgress>,
@@ -617,6 +617,9 @@ impl State {
         depth: usize,
         stack: &[Frame],
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(store) = &self.shift_path_store {
+            store.flush().map_err(std::io::Error::other)?;
+        }
         self.write_checkpoint_file(
             path,
             &Checkpoint {
@@ -632,7 +635,7 @@ impl State {
                 completed: Vec::new(),
                 in_progress: Vec::new(),
                 pending_prefixes: Vec::new(),
-                work_prefixes: None,
+                use_previous_depth_paths: false,
                 config_hash: self.compute_config_hash(),
             },
         )
@@ -782,8 +785,8 @@ impl State {
         });
 
         let mut split_depth = self.parallel_split_depth(depth);
-        let mut checkpoint_work_prefixes = None;
         let mut checkpoint_resumed = false;
+        let mut use_previous_depth_paths = false;
         if let Some(path) = resume_path {
             let checkpoint = Self::load_checkpoint(path)?;
             if checkpoint.mode != SearchMode::Parallel {
@@ -804,7 +807,7 @@ impl State {
                 .map_err(std::io::Error::other)?;
             if let Some((shifts, target_shifts)) = paths {
                 split_depth = checkpoint.split_depth;
-                checkpoint_work_prefixes = checkpoint.work_prefixes;
+                use_previous_depth_paths = checkpoint.use_previous_depth_paths;
                 checkpoint_resumed = true;
                 node_count.store(checkpoint.node_count, Ordering::Relaxed);
                 results
@@ -837,14 +840,20 @@ impl State {
             }
         }
 
-        let work_items = if let Some(work_prefixes) = checkpoint_work_prefixes {
-            self.work_items_from_prefixes(depth, work_prefixes)?
-        } else if checkpoint_resumed {
-            self.parallel_work_items(split_depth)?
+        let work_items = if checkpoint_resumed {
+            if use_previous_depth_paths {
+                let previous_paths = self
+                    .load_previous_depth_paths(depth)?
+                    .ok_or("チェックポイントで必要な前段パスが RocksDB にありません")?;
+                self.previous_depth_work_items(depth, previous_paths)?
+            } else {
+                self.parallel_work_items(split_depth)?
+            }
         } else if let Some(previous_paths) = self.load_previous_depth_paths(depth)? {
             if split_depth != depth - 1 {
                 split_depth = depth - 1;
             }
+            use_previous_depth_paths = true;
             let work_items = self.previous_depth_work_items(depth, previous_paths)?;
             info!(
                 "depth={} の開始ワーク項目として depth={} の保存済みパス {} 件を使用します",
@@ -864,6 +873,7 @@ impl State {
         let ctx = ParallelSearchCtx {
             depth,
             split_depth,
+            use_previous_depth_paths,
             results: results.as_ref(),
             node_count: node_count.as_ref(),
             progress: &progress,
@@ -959,15 +969,18 @@ impl State {
             let key = work_item.key;
             if ctx.split_depth == depth {
                 let count = masks[ctx.split_depth].count_ones();
-                if count < self.target {
-                } else {
+                if count >= self.target {
+                    let _guard = ctx
+                        .checkpoint_lock
+                        .lock()
+                        .map_err(|_| "チェックポイントロック取得に失敗しました".to_string())?;
                     if let Some(store) = &ctx.results.shift_path_store {
                         store.append(count, &key)?;
                     }
                     ctx.results.record_target(depth, count, &key)?;
                     ctx.results.record_path(count, &key)?;
                 }
-                self.finish_parallel_job(index, ctx)?;
+                self.finish_parallel_job(index, 0, ctx)?;
                 return Ok(());
             }
             let stack = vec![Frame {
@@ -978,24 +991,39 @@ impl State {
         };
 
         if ctx.split_depth == depth {
-            self.finish_parallel_job(index, ctx)?;
+            self.finish_parallel_job(index, 0, ctx)?;
             return Ok(());
         }
 
         if masks[key.len()].count_ones() < self.target {
-            self.finish_parallel_job(index, ctx)?;
+            self.finish_parallel_job(index, 0, ctx)?;
             return Ok(());
         }
 
-        self.store_parallel_progress(index, &stack, &key, ctx);
+        self.store_parallel_progress(index, &stack, &key, 0, ctx)?;
         let mut local_nodes = 0_u64;
 
-        while let Some(frame) = stack.last_mut() {
+        loop {
             if ctx.interrupted.load(Ordering::SeqCst) {
-                ctx.node_count.fetch_add(local_nodes, Ordering::Relaxed);
-                self.store_parallel_progress(index, &stack, &key, ctx);
+                self.store_parallel_progress(index, &stack, &key, local_nodes, ctx)?;
                 return Ok(());
             }
+            if local_nodes >= self.checkpoint_interval {
+                let n = self.store_parallel_progress(index, &stack, &key, local_nodes, ctx)?;
+                local_nodes = 0;
+                let shared = ctx.results.snapshot();
+                Self::update_progress(
+                    ctx.progress_bar.as_ref(),
+                    n,
+                    shared.max_score,
+                    shared.results,
+                    key.len(),
+                );
+                self.write_parallel_checkpoint(ctx, false, true)?;
+            }
+            let Some(frame) = stack.last_mut() else {
+                break;
+            };
             if frame.next_idx == 0 {
                 stack.pop();
                 if stack.last().is_some() {
@@ -1013,29 +1041,6 @@ impl State {
             let c_count =
                 node_masks[0].bitand_into_count(&base_masks[level], &self.shift_table[level][idx]);
 
-            if local_nodes == self.checkpoint_interval {
-                let n = ctx.node_count.fetch_add(local_nodes, Ordering::Relaxed) + local_nodes;
-                local_nodes = 0;
-                let shared = ctx.results.snapshot();
-                Self::update_progress(
-                    ctx.progress_bar.as_ref(),
-                    n,
-                    shared.max_score,
-                    shared.results,
-                    key.len(),
-                );
-                // info!(
-                //     "探索経過: nodes={} best={} hit={} depth={} key={:?}",
-                //     n,
-                //     shared.max_score,
-                //     shared.results,
-                //    key.len(),
-                //    key
-                //);
-                self.store_parallel_progress(index, &stack, &key, ctx);
-                self.write_parallel_checkpoint(ctx, false, true)?;
-            }
-
             if c_count < self.target {
                 // info!(
                 //     "target break (depth={}, count={}, key={:?})",
@@ -1047,25 +1052,30 @@ impl State {
                 continue;
             }
 
-            if let Some(store) = &ctx.results.shift_path_store {
-                store.append(c_count, &key)?;
-            }
-
             if level + 1 >= depth {
+                let _guard = ctx
+                    .checkpoint_lock
+                    .lock()
+                    .map_err(|_| "チェックポイントロック取得に失敗しました".to_string())?;
+                if let Some(store) = &ctx.results.shift_path_store {
+                    store.append(c_count, &key)?;
+                }
                 ctx.results.record_target(depth, c_count, &key)?;
                 ctx.results.record_path(c_count, &key)?;
                 key.pop();
                 continue;
             }
 
+            if let Some(store) = &ctx.results.shift_path_store {
+                store.append(c_count, &key)?;
+            }
             stack.push(Frame {
                 level: level + 1,
                 next_idx: self.primes[level + 1],
             });
         }
 
-        ctx.node_count.fetch_add(local_nodes, Ordering::Relaxed);
-        self.finish_parallel_job(index, ctx)
+        self.finish_parallel_job(index, local_nodes, ctx)
     }
 
     fn store_parallel_progress(
@@ -1073,9 +1083,16 @@ impl State {
         work_index: usize,
         stack: &[Frame],
         key: &[usize],
+        node_increment: u64,
         ctx: &ParallelSearchCtx<'_>,
-    ) {
-        ctx.progress.lock().unwrap().in_progress.insert(
+    ) -> Result<u64, String> {
+        let mut progress = ctx
+            .progress
+            .lock()
+            .map_err(|_| "並列進捗ロック取得に失敗しました".to_string())?;
+        let node_count =
+            ctx.node_count.fetch_add(node_increment, Ordering::Relaxed) + node_increment;
+        progress.in_progress.insert(
             work_index,
             ParallelInProgress {
                 work_index,
@@ -1083,15 +1100,21 @@ impl State {
                 key: key.to_vec(),
             },
         );
+        Ok(node_count)
     }
 
     fn finish_parallel_job(
         &self,
         work_index: usize,
+        node_increment: u64,
         ctx: &ParallelSearchCtx<'_>,
     ) -> Result<(), String> {
         {
-            let mut progress = ctx.progress.lock().unwrap();
+            let mut progress = ctx
+                .progress
+                .lock()
+                .map_err(|_| "並列進捗ロック取得に失敗しました".to_string())?;
+            ctx.node_count.fetch_add(node_increment, Ordering::Relaxed);
             progress.in_progress.remove(&work_index);
             progress.completed.insert(work_index);
         }
@@ -1123,13 +1146,33 @@ impl State {
                 }
             }
         };
+        let progress = ctx
+            .progress
+            .lock()
+            .map_err(|_| "並列進捗ロック取得に失敗しました".to_string())?;
+        let results = ctx
+            .results
+            .results
+            .lock()
+            .map_err(|_| "探索結果ロック取得に失敗しました".to_string())?;
+        if let Some(store) = &ctx.results.shift_path_store {
+            store.flush()?;
+        }
         let n = ctx.node_count.load(Ordering::Relaxed);
         let last = ctx.last_checkpoint_nodes.load(Ordering::Relaxed);
         if require_interval && n.saturating_sub(last) < self.checkpoint_interval {
             return Ok(());
         }
+        let mut shared = results.clone();
+        shared.max_score = ctx.results.max_score.load(Ordering::Relaxed);
+        let mut completed: Vec<usize> = progress.completed.iter().copied().collect();
+        completed.sort_unstable();
+        let mut in_progress: Vec<ParallelInProgress> =
+            progress.in_progress.values().cloned().collect();
+        in_progress.sort_unstable_by_key(|item| item.work_index);
+        drop(results);
+        drop(progress);
 
-        let shared = ctx.results.snapshot();
         self.write_checkpoint_file(
             path,
             &Checkpoint {
@@ -1142,10 +1185,10 @@ impl State {
                 target_count: shared.target_count,
                 node_count: n,
                 split_depth: ctx.split_depth,
-                completed: Vec::new(),
-                in_progress: Vec::new(),
+                completed,
+                in_progress,
                 pending_prefixes: Vec::new(),
-                work_prefixes: None,
+                use_previous_depth_paths: ctx.use_previous_depth_paths,
                 config_hash: self.compute_config_hash(),
             },
         )
@@ -1398,7 +1441,7 @@ mod tests {
                     completed: Vec::new(),
                     in_progress: Vec::new(),
                     pending_prefixes: Vec::new(),
-                    work_prefixes: None,
+                    use_previous_depth_paths: false,
                     config_hash: state.compute_config_hash(),
                 },
             )
@@ -1461,7 +1504,7 @@ mod tests {
                     completed: Vec::new(),
                     in_progress: Vec::new(),
                     pending_prefixes: Vec::new(),
-                    work_prefixes: None,
+                    use_previous_depth_paths: false,
                     config_hash: state.compute_config_hash(),
                 },
             )
@@ -1626,10 +1669,8 @@ mod tests {
         let resumed_result = resumed
             .search_parallel(depth, Some(&checkpoint_path), Some(&checkpoint_path))
             .unwrap();
-        let mut expected = State::new(vec![2; depth], cols, build_shift_table(&[2; 2], cols));
-        expected.target = 0;
-        let expected_result = expected.search_parallel(depth, None, None).unwrap();
-        assert_eq!(resumed_result.shifts, expected_result.shifts);
+        assert_eq!(resumed_result.shifts, result.shifts);
+        assert_eq!(resumed_result.results, result.results);
 
         let _ = std::fs::remove_file(checkpoint_path);
         drop(resumed);
@@ -1780,7 +1821,7 @@ mod tests {
             completed: vec![],
             in_progress: vec![],
             pending_prefixes: vec![],
-            work_prefixes: None,
+            use_previous_depth_paths: false,
             config_hash: 0,
         };
         let json = serde_json::to_string_pretty(&checkpoint).unwrap();
@@ -1858,7 +1899,7 @@ mod tests {
             completed: Vec::new(),
             in_progress: Vec::new(),
             pending_prefixes: Vec::new(),
-            work_prefixes: None,
+            use_previous_depth_paths: false,
             config_hash: state.compute_config_hash(),
         };
         serde_json::to_writer(std::fs::File::create(&json_path).unwrap(), &checkpoint).unwrap();
@@ -1943,7 +1984,95 @@ mod tests {
     }
 
     #[test]
-    fn parallel_checkpoint_omits_work_lists_and_restarts_work_items() {
+    fn parallel_checkpoint_resumes_an_in_progress_work_item() {
+        let primes = vec![2, 3];
+        let cols = 4;
+        let depth = 2;
+        let table = build_shift_table(&primes, cols);
+        let checkpoint_path = unique_checkpoint_path("parallel-in-progress");
+        let database_path = checkpoint_path.with_extension("rocksdb");
+        let mut state = State::new(primes.clone(), cols, table.clone());
+        state.target = 0;
+        let split_depth = 1;
+        let work_items = state.parallel_work_items(split_depth).unwrap();
+        assert_eq!(work_items.len(), 2);
+        state
+            .set_shift_path_store(&database_path, depth, true)
+            .unwrap();
+
+        let processed_paths = [vec![1, 2], vec![0, 2], vec![0, 1], vec![0, 0]];
+        let scored_paths: Vec<(usize, Vec<usize>)> = processed_paths
+            .into_iter()
+            .map(|path| {
+                let score = state.rebuild_masks(depth, &path)[depth].count_ones();
+                (score, path)
+            })
+            .collect();
+        let max_score = scored_paths.iter().map(|(score, _)| *score).max().unwrap();
+        let best_paths: Vec<Vec<usize>> = scored_paths
+            .iter()
+            .filter(|(score, _)| *score == max_score)
+            .map(|(_, path)| path.clone())
+            .collect();
+        let store = state.shift_path_store.as_ref().unwrap();
+        for (score, path) in &scored_paths {
+            store.append(*score, path).unwrap();
+        }
+        store.flush().unwrap();
+        state
+            .write_checkpoint_file(
+                &checkpoint_path,
+                &super::Checkpoint {
+                    mode: super::SearchMode::Parallel,
+                    depth,
+                    stack: Vec::new(),
+                    key: Vec::new(),
+                    max_score,
+                    results: best_paths.len(),
+                    target_count: 0,
+                    node_count: 4,
+                    split_depth,
+                    completed: vec![1],
+                    in_progress: vec![super::ParallelInProgress {
+                        work_index: 0,
+                        stack: vec![super::Frame {
+                            level: 1,
+                            next_idx: 2,
+                        }],
+                        key: vec![1],
+                    }],
+                    pending_prefixes: Vec::new(),
+                    use_previous_depth_paths: false,
+                    config_hash: state.compute_config_hash(),
+                },
+            )
+            .unwrap();
+        drop(state);
+
+        let mut resumed = State::new(primes.clone(), cols, table.clone());
+        resumed.target = 0;
+        resumed
+            .set_shift_path_store(&database_path, depth, false)
+            .unwrap();
+        let resumed_result = resumed
+            .search_parallel(depth, Some(&checkpoint_path), Some(&checkpoint_path))
+            .unwrap();
+
+        let mut expected = State::new(primes, cols, table);
+        expected.target = 0;
+        let expected_result = expected.search_parallel(depth, None, None).unwrap();
+        assert_eq!(resumed_result.max_score, expected_result.max_score);
+        assert_eq!(resumed_result.results, expected_result.results);
+        assert_eq!(resumed_result.shifts, expected_result.shifts);
+        assert_eq!(resumed_result.node_count, 6);
+
+        drop(resumed);
+        let _ = std::fs::remove_file(checkpoint_path);
+        let _ = std::fs::remove_dir_all(database_path);
+    }
+
+    #[test]
+    fn parallel_checkpoint_saves_completed_work_and_skips_it_on_resume() {
         let primes = vec![2, 3, 5];
         let cols = 8;
         let depth = 3;
@@ -1988,7 +2117,7 @@ mod tests {
                     completed,
                     in_progress: Vec::new(),
                     pending_prefixes: Vec::new(),
-                    work_prefixes: None,
+                    use_previous_depth_paths: false,
                     config_hash: state.compute_config_hash(),
                 },
             )
@@ -1999,8 +2128,8 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert!(!checkpoint.contains("\"completed\""));
-        assert!(!checkpoint.contains("\"in_progress\""));
+        assert!(checkpoint.contains("\"completed\""));
+        assert!(checkpoint.contains("\"in_progress\""));
         assert!(!checkpoint.contains("\"work_prefixes\""));
         drop(state); // RocksDB のロック解放
 
@@ -2015,13 +2144,14 @@ mod tests {
         assert_eq!(result.max_score, expected.max_score);
         assert_eq!(result.results, expected.results);
         assert_eq!(result.shifts, expected.shifts);
+        assert_eq!(result.node_count, 42);
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(database_path);
     }
 
     #[test]
-    fn checkpoint_ignores_legacy_work_lists() {
+    fn checkpoint_loads_parallel_progress_and_ignores_legacy_work_lists() {
         let checkpoint: super::Checkpoint = serde_json::from_str(
             r#"{
                 "mode":"parallel",
@@ -2040,10 +2170,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(checkpoint.completed.is_empty());
-        assert!(checkpoint.in_progress.is_empty());
+        assert_eq!(checkpoint.completed, vec![0, 1, 2]);
+        assert_eq!(checkpoint.in_progress.len(), 1);
+        assert_eq!(checkpoint.in_progress[0].work_index, 3);
         assert!(checkpoint.pending_prefixes.is_empty());
-        assert!(checkpoint.work_prefixes.is_none());
     }
 
     #[test]
@@ -2098,7 +2228,7 @@ mod tests {
                     completed: Vec::new(),
                     in_progress: Vec::new(),
                     pending_prefixes: Vec::new(),
-                    work_prefixes: None,
+                    use_previous_depth_paths: false,
                     config_hash: 0,
                 },
             )

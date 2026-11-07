@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 const CHECKPOINT_FILENAME: &str = "checkpoint.sqlite";
-const MAX_COLS: usize = 3159;
+const COLS: usize = 3159;
 
 #[derive(Serialize)]
 struct OutputFile<'a> {
@@ -60,9 +60,6 @@ pub struct Cli {
     )]
     pub mode: SearchMode,
 
-    #[arg(long, default_value_t = MAX_COLS, help = "列数 (長さ、最大 3159)")]
-    pub cols: usize,
-
     #[arg(short, long, default_value = ".", help = "出力ディレクトリ")]
     pub output_dir: PathBuf,
 
@@ -78,12 +75,6 @@ impl Cli {
     fn validate(&self, available_primes: usize) -> Result<(), String> {
         if self.depth == 0 {
             return Err("depth must be at least 1".to_string());
-        }
-        if self.cols == 0 {
-            return Err("cols must be at least 1".to_string());
-        }
-        if self.cols > MAX_COLS {
-            return Err(format!("cols ({}) cannot exceed {MAX_COLS}", self.cols));
         }
         if self.checkpoint_interval == 0 {
             return Err("checkpoint-interval must be at least 1".to_string());
@@ -126,8 +117,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let start_time = Instant::now();
-    let shift_table = build_shift_table(&primes[..cli.depth], cli.cols);
-    let mut state = State::new(primes, cli.cols, shift_table);
+    let shift_table = build_shift_table(&primes[..cli.depth], COLS);
+    let mut state = State::new(primes, COLS, shift_table);
     state.checkpoint_interval = cli.checkpoint_interval;
     let progress_bar = ProgressBar::new_spinner();
     progress_bar.set_style(
@@ -220,7 +211,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         shift_path.display()
     );
 
-    let result_path = with_timestamp(&cli.output_dir.join("result.txt"), cli.depth);
+    let result_path = with_timestamp(&cli.output_dir.join("result.json"), cli.depth);
     let result_file = File::create(&result_path)?;
     let mut result_writer = BufWriter::new(result_file);
     info!("探索結果出力ファイル: {}", result_path.display());
@@ -232,7 +223,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 SearchMode::Parallel => "parallel",
             },
             depth: cli.depth,
-            cols: cli.cols,
+            cols: COLS,
             elapsed: format!("{elapsed:?}"),
         },
         result: OutputResult {
@@ -258,7 +249,6 @@ mod tests {
         Cli {
             depth: 1,
             mode: SearchMode::Sequential,
-            cols: 4,
             output_dir: PathBuf::from("."),
             checkpoint_interval: 100_000,
         }
@@ -275,21 +265,13 @@ mod tests {
         cli.depth = 0;
         assert!(cli.validate(3).is_err());
         cli = test_cli();
-        cli.cols = 0;
-        assert!(cli.validate(3).is_err());
-        cli = test_cli();
-        cli.cols = MAX_COLS + 1;
-        assert!(cli.validate(3).is_err());
-        cli = test_cli();
         cli.checkpoint_interval = 0;
         assert!(cli.validate(3).is_err());
     }
 
     #[test]
-    fn cli_validation_accepts_maximum_column_count() {
-        let mut cli = test_cli();
-        cli.cols = MAX_COLS;
-        assert!(cli.validate(3).is_ok());
+    fn cli_rejects_removed_cols_option() {
+        assert!(Cli::try_parse_from(["hlsearch", "--cols", "100"]).is_err());
     }
 
     #[test]

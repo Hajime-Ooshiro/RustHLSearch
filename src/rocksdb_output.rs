@@ -13,10 +13,12 @@
 use rocksdb::{ColumnFamilyDescriptor, Direction, IteratorMode, Options, WriteBatch, DB};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 const MAX_DEPTH: usize = 249;
+const SHARD_COUNT: usize = 210;
+const SHARD_CONFIG_FILENAME: &str = "shards.config";
 const DEPTH_SHIFT: u32 = 48;
 const SEQ_MASK: u64 = (1u64 << DEPTH_SHIFT) - 1;
 
@@ -83,7 +85,7 @@ fn cf<'a>(db: &'a DB, name: &str) -> Result<&'a rocksdb::ColumnFamily, String> {
 }
 
 #[derive(Clone)]
-pub struct ShiftPathStore {
+struct ShardStore {
     db: Arc<DB>,
     depth: usize,
     pending_appends: Arc<Mutex<PendingAppends>>,
@@ -91,7 +93,7 @@ pub struct ShiftPathStore {
     next_seq: Arc<Mutex<Vec<u64>>>,
 }
 
-impl ShiftPathStore {
+impl ShardStore {
     pub fn create(
         path: &Path,
         depth: usize,
@@ -355,10 +357,240 @@ impl ShiftPathStore {
     }
 }
 
-impl Drop for ShiftPathStore {
+impl Drop for ShardStore {
     fn drop(&mut self) {
-        let _ = self.flush();
+        if Arc::strong_count(&self.db) == 1 {
+            let _ = self.flush();
+        }
     }
+}
+
+/// 210 個の RocksDB パーティションへパスを安定して分散するストア。
+///
+/// 接頭辞を含むパス全体でパーティションを選ぶため、各パーティションは独立した
+/// 木として読み書きできる。接頭辞は複数のパーティションに複製され得る。
+#[derive(Clone)]
+pub struct ShiftPathStore {
+    path: PathBuf,
+    depth: usize,
+    clear_existing: bool,
+    config_hash: u64,
+    shards: Arc<Mutex<HashMap<usize, ShardStore>>>,
+}
+
+impl ShiftPathStore {
+    pub fn create(
+        path: &Path,
+        depth: usize,
+        clear_existing: bool,
+        config_hash: u64,
+    ) -> Result<Self, String> {
+        std::fs::create_dir_all(path).map_err(err)?;
+        check_shard_config(path, depth, config_hash)?;
+        let store = Self {
+            path: path.to_path_buf(),
+            depth,
+            clear_existing,
+            config_hash,
+            shards: Arc::new(Mutex::new(HashMap::new())),
+        };
+        for index in store.shard_indexes()? {
+            store.shard(index)?;
+        }
+        Ok(store)
+    }
+
+    pub fn append(&self, max_count: usize, path: &[usize]) -> Result<(), String> {
+        if path.is_empty() {
+            return Ok(());
+        }
+        self.shard(shard_index(path))?.append(max_count, path)
+    }
+
+    pub fn flush(&self) -> Result<(), String> {
+        for shard in self.loaded_shards()? {
+            shard.flush()?;
+        }
+        Ok(())
+    }
+
+    pub fn append_target(&self, target_count: usize, path: &[usize]) -> Result<(), String> {
+        self.shard(shard_index(path))?
+            .append_target(target_count, path)
+    }
+
+    pub fn clear_all_paths(&self) -> Result<(), String> {
+        for index in self.shard_indexes()? {
+            self.shard(index)?.clear_all_paths()?;
+        }
+        Ok(())
+    }
+
+    pub fn load_result_paths(&self, max_count: usize) -> Result<Vec<Vec<usize>>, String> {
+        self.load_paths(|shard| shard.load_result_paths(max_count))
+    }
+
+    pub fn load_viable_depth_paths(
+        &self,
+        depth: usize,
+        min_score: usize,
+    ) -> Result<Vec<Vec<usize>>, String> {
+        self.load_paths(|shard| shard.load_viable_depth_paths(depth, min_score))
+    }
+
+    #[cfg(test)]
+    fn load_leaf_paths(
+        &self,
+        depth: usize,
+        min_score: Option<usize>,
+        max_count: Option<usize>,
+    ) -> Result<Vec<Vec<usize>>, String> {
+        self.load_paths(|shard| shard.load_leaf_paths(depth, min_score, max_count))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn load_nodes(&self, depth: usize) -> Result<Vec<(u64, NodeRecord)>, String> {
+        let mut nodes = Vec::new();
+        for shard in self.all_shards()? {
+            nodes.extend(shard.load_nodes(depth)?);
+        }
+        nodes.sort_unstable_by_key(|(_, record)| (record.parent_node_id, record.shift));
+        Ok(nodes)
+    }
+
+    pub fn load_target_paths(&self) -> Result<Vec<Vec<usize>>, String> {
+        self.load_paths(|shard| shard.load_target_paths())
+    }
+
+    fn load_paths<F>(&self, load: F) -> Result<Vec<Vec<usize>>, String>
+    where
+        F: Fn(&ShardStore) -> Result<Vec<Vec<usize>>, String>,
+    {
+        let mut paths = Vec::new();
+        for shard in self.all_shards()? {
+            paths.extend(load(&shard)?);
+        }
+        paths.sort_unstable();
+        paths.dedup();
+        Ok(paths)
+    }
+
+    #[cfg(test)]
+    fn pending_append_count(&self) -> usize {
+        self.loaded_shards()
+            .unwrap()
+            .iter()
+            .map(|shard| shard.pending_appends.lock().unwrap().len())
+            .sum()
+    }
+
+    #[cfg(test)]
+    fn node_is_buffered(&self, path: &[usize]) -> Result<bool, String> {
+        let shard = self.shard(shard_index(path))?;
+        let nodes_cf = cf(&shard.db, CF_NODES)?;
+        Ok(shard
+            .db
+            .get_cf(nodes_cf, make_node_id(path.len(), 1).to_be_bytes())
+            .map_err(err)?
+            .is_some())
+    }
+
+    fn shard(&self, index: usize) -> Result<ShardStore, String> {
+        let mut shards = self
+            .shards
+            .lock()
+            .map_err(|_| "RocksDB パーティションのロック取得に失敗しました".to_string())?;
+        if let Some(shard) = shards.get(&index) {
+            return Ok(shard.clone());
+        }
+        let shard_path = self.path.join(format!("part-{index:03}.rocksdb"));
+        let shard = ShardStore::create(
+            &shard_path,
+            self.depth,
+            self.clear_existing,
+            self.config_hash,
+        )?;
+        shards.insert(index, shard.clone());
+        Ok(shard)
+    }
+
+    fn loaded_shards(&self) -> Result<Vec<ShardStore>, String> {
+        Ok(self
+            .shards
+            .lock()
+            .map_err(|_| "RocksDB パーティションのロック取得に失敗しました".to_string())?
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    fn all_shards(&self) -> Result<Vec<ShardStore>, String> {
+        self.shard_indexes()?
+            .into_iter()
+            .map(|index| self.shard(index))
+            .collect()
+    }
+
+    fn shard_indexes(&self) -> Result<Vec<usize>, String> {
+        let mut indexes: Vec<usize> = std::fs::read_dir(&self.path)
+            .map_err(err)?
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.strip_prefix("part-"))
+                    .and_then(|name| name.strip_suffix(".rocksdb"))
+                    .and_then(|index| index.parse::<usize>().ok())
+            })
+            .filter(|&index| index < SHARD_COUNT)
+            .collect();
+        {
+            let shards = self
+                .shards
+                .lock()
+                .map_err(|_| "RocksDB パーティションのロック取得に失敗しました".to_string())?;
+            indexes.extend(shards.keys().copied());
+        }
+        indexes.sort_unstable();
+        indexes.dedup();
+        Ok(indexes)
+    }
+}
+
+fn shard_index(path: &[usize]) -> usize {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for &shift in path {
+        for byte in (shift as u64).to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    (hash as usize) % SHARD_COUNT
+}
+
+fn check_shard_config(path: &Path, depth: usize, config_hash: u64) -> Result<(), String> {
+    let config_path = path.join(SHARD_CONFIG_FILENAME);
+    let current = format!("{depth}:{config_hash}");
+    if config_path.exists() {
+        let stored = std::fs::read_to_string(&config_path).map_err(err)?;
+        if let Some(previous) = stored
+            .lines()
+            .find(|line| line.starts_with(&format!("{depth}:")))
+        {
+            if previous != current {
+                return Err(format!(
+                    "設定ハッシュが異なります。別の --output-dir を使用してください (stored={}, current={})",
+                    previous, current
+                ));
+            }
+        } else {
+            std::fs::write(config_path, format!("{}{current}\n", stored)).map_err(err)?;
+        }
+    } else {
+        std::fs::write(config_path, format!("{current}\n")).map_err(err)?;
+    }
+    Ok(())
 }
 
 fn read_node(db: &DB, node_id: u64) -> Result<Option<NodeRecord>, String> {
@@ -443,7 +675,7 @@ fn clear_column_family(db: &DB, column_family: &rocksdb::ColumnFamily) -> Result
 
 #[cfg(test)]
 mod tests {
-    use super::{NodeRecord, ShiftPathStore};
+    use super::{NodeRecord, ShiftPathStore, SHARD_COUNT};
 
     fn database_path() -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -472,7 +704,7 @@ mod tests {
         assert_eq!(store.load_result_paths(11).unwrap(), vec![vec![1, 3]]);
 
         let roots = store.load_nodes(1).unwrap();
-        assert_eq!(roots.len(), 1);
+        assert_eq!(roots.len(), 3);
         let root_id = roots[0].0;
         let nodes: Vec<NodeRecord> = store
             .load_nodes(2)
@@ -520,22 +752,13 @@ mod tests {
 
         store.append(4, &[1]).unwrap();
 
-        assert_eq!(store.pending_appends.lock().unwrap().len(), 1);
-        let nodes_cf = super::cf(&store.db, super::CF_NODES).unwrap();
-        assert!(store
-            .db
-            .get_cf(nodes_cf, super::make_node_id(1, 1).to_be_bytes())
-            .unwrap()
-            .is_none());
+        assert_eq!(store.pending_append_count(), 1);
+        assert!(!store.node_is_buffered(&[1]).unwrap());
 
         store.flush().unwrap();
 
-        assert!(store.pending_appends.lock().unwrap().is_empty());
-        assert!(store
-            .db
-            .get_cf(nodes_cf, super::make_node_id(1, 1).to_be_bytes())
-            .unwrap()
-            .is_some());
+        assert_eq!(store.pending_append_count(), 0);
+        assert!(store.node_is_buffered(&[1]).unwrap());
 
         drop(store);
         std::fs::remove_dir_all(path).unwrap();
@@ -593,7 +816,7 @@ mod tests {
             store.load_leaf_paths(2, None, None).unwrap(),
             vec![vec![1, 2], vec![1, 3]]
         );
-        assert_eq!(store.load_nodes(1).unwrap().len(), 1);
+        assert_eq!(store.load_nodes(1).unwrap().len(), 2);
 
         drop(store);
         std::fs::remove_dir_all(path).unwrap();
@@ -621,6 +844,22 @@ mod tests {
         let store = ShiftPathStore::create(&path, 2, true, 1).unwrap();
         drop(store);
         assert!(ShiftPathStore::create(&path, 2, false, 2).is_err());
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn distributes_paths_across_all_shards() {
+        let path = database_path();
+        let store = ShiftPathStore::create(&path, 1, true, 12345).unwrap();
+        assert_eq!(SHARD_COUNT, 210);
+
+        for shift in 0..SHARD_COUNT {
+            store.append(1, &[shift]).unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(store.load_nodes(1).unwrap().len(), SHARD_COUNT);
+
+        drop(store);
         std::fs::remove_dir_all(path).unwrap();
     }
 }

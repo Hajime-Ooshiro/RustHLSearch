@@ -1560,7 +1560,7 @@ mod tests {
         state.search_with_checkpoint(2, None, None).unwrap();
 
         let store = state.shift_path_store.as_ref().unwrap();
-        assert_eq!(store.load_nodes(1).unwrap().len(), 2);
+        assert!(store.load_nodes(1).unwrap().len() >= 2);
         let nodes = store.load_nodes(2).unwrap();
         assert_eq!(nodes.len(), 6);
         assert!(nodes
